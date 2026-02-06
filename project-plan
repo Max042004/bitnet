@@ -1,0 +1,81 @@
+﻿參賽編號：主辦單位填寫；報名時參賽隊伍免填。
+	參賽類別：Processor/SOC
+類別補充說明：
+參賽類別選擇Other Design或Other Application請填寫無法分類之原因。
+	作品名稱：
+(中文) 基於 FPGA 的無 DSP 邊緣推論加速方案
+(English) DSP-Free FPGA Inference Accelerator
+	作品摘要：
+
+
+目前多數 FPGA AI 加速方案，無論面向 CNN 或 Transformer，幾乎都以 DSP block 作為效能與吞吐量的主要來源。這樣的設計在中高階 FPGA 上合理，但在低階或邊緣等級 FPGA 上，DSP 數量往往稀少、功耗高，甚至成為可擴充性的硬限制。Microsoft Research 提出的 BitNet b1.58 所引入的三元權重 {-1, 0, +1}，從根本上顛覆這個假設。當模型的核心運算不再需要乘法，DSP block 便不再是必要資源，反而成為可有可無的選項。這使得以 LUT、暫存器與 BRAM 為主體的 FPGA 架構，首次成為大型模型推論在邊緣端的合理解法。
+
+
+本提案的發想即是，透過 BitNet 的消除乘法特性，設計一套完全不依賴 DSP 單元的 FPGA 邊緣推論加速器，讓低階 FPGA 也能承擔實用等級的模型推論工作。為何 DSP-Free 是關鍵賣點？在邊緣 FPGA 場景中，DSP-Free 並非只是節省資源，而是直接改變可行性邊界。
+1. DSP 數量在低階 FPGA 上高度受限，甚至完全不存在。若設計從一開始就假設需要 DSP，等同排除大量低成本平台
+2. DSP block 的功耗密度高，對於長時間運作、被動散熱的邊緣裝置並不友善。相較之下，LUT-based 加減與條件邏輯可在較低時脈下運作，能效更可控
+3. DSP 常成為設計的硬瓶頸。當 DSP 用盡後，即使 LUT 與 BRAM 尚有餘裕，也無法再擴充計算單元。DSP-Free 架構則能隨 LUT 線性擴展，資源利用率更均衡
+
+
+BitNet 的三元權重正好使這種設計成為可能，這不是一般量化模型能自然達成的結果，而是模型與硬體共同演化的產物。本作品選定 DE10-Nano Kit 作為實驗和評估，其搭載的 Altera Cyclone V FPGA，雖然具備少量 DSP，但其真正的優勢在於充足的 LUT 與 BRAM，以及與 ARM HPS 共享 DDR 的 SoC 架構。在本方案中，DSP 並非被「避免使用」，而是被設計上「完全不需要」。所有關鍵計算單元均以 LUT、暫存器與加法樹構成，使架構可無縫下放至更低階、DSP 更稀少甚至為零的 FPGA 平台。
+
+
+BitNet b1.58 的主體運算可描述為
+activation × weight
+其中 weight ∈ {-1, 0, +1}
+此運算可重寫為
+* weight = 0 → 輸出 0
+* weight = +1 → 輸出 activation
+* weight = -1 → 輸出 -activation
+
+
+整個計算空間只需要
+* 條件選擇
+* 符號反相
+* 加法累加
+這正是 FPGA LUT 最擅長的運算型態，而非 DSP block 的專長。本設計採用完全的資料流 (Dataflow-oriented) 導向，捨棄傳統卷積或矩陣運算IP中的乘法累加單元 (MAC)，轉而利用 BitNet 的三元特性，將運算簡化為純邏輯閘操作。
+權重解壓縮與高速串流 (Weight Streaming)
+* 儲存格式： 權重在 DDR3 中以 2-bit 格式 (00=0, 01=+1, 10=-1, 11=Reserved) 緊湊儲存
+* 傳輸機制： 利用 Cyclone V 的 FPGA-to-SDRAM Bridge (Avalon-MM/AXI) 建立寬匯流排 (如 128-bit/256-bit)，以 Burst Mode 將權重串流讀入 FPGA
+* 即時解碼： 資料進入 Fabric 後不進行快取，直接由解碼器拆解為 Enable (致能) 與 Sign (符號) 控制訊號，分發至計算陣列
+每個 PE 的設計目標是最小化 ALM (Adaptive Logic Module) 消耗，完全不使用 DSP Block：
+* 邏輯組成：
+   * Zero Gating： 當 Enable=0 時，輸出強制為 0（AND Gate）。
+   * Sign Inversion： 當 Sign=1 時，對輸入 Activation 進行 2's Complement 反相（XOR + Carry-in）
+   * Adder： 純 INT8 加法器
+* 特性：
+   * 無乘法器： 徹底消除硬體乘法路徑
+   * 資源線性擴充： 由於不依賴稀缺的 DSP 資源，PE 數量僅受限於 LE (Logic Elements) 總量與佈線擁塞度，適合在 FPGA Fabric 上大規模鋪開
+加法樹與動態量化 (Adder Tree & Re-quantization)
+* 並行累加： 數十至數百個 PE 的輸出進入 LUT-based Adder Tree，在流水線（Pipeline）中逐級加總
+* 精度管理： 中間累加值位寬自動擴展（如 INT16/INT20）以防止溢位，直至最終級
+* 輸出量化： 透過硬體固定的 Shift 與 Clamp 邏輯，將累加結果重新壓縮回 INT8，確保全流程皆為定點運算
+非線性層處理 (Normalization & Activation)
+* RMSNorm / SwiGLU： 避免實作昂貴的除法器或開根號電路
+* 方案： 採用 分段線性逼近 (Piecewise Linear Approximation, PWL) 或 BRAM 查找表 (LUT) 來實現 Activation Function，保持 DSP-Free 原則並降低延遲
+
+
+在 DE10-Nano 上，由於沒有乘法運算瓶頸，記憶體頻寬 (Memory Wall) 將成為效能的決定性因素。本方案採用「HPS 協同 + 串流優先」策略。
+1. 權重 (Weights)：DDR 常駐，串流存取
+* 權重資料量遠大於 FPGA 片上記憶體（Cyclone V SE 的 M10K 總量僅約 5Mb)
+* 策略： 權重常駐於 DDR3，由 HPS 預先載入。FPGA 僅在運算時通過高速橋接器以 Tile-based 方式串流讀取，不在 FPGA 內部建立權重快取，最大化利用頻寬
+2. Activation (KV Cache & Intermediate)：BRAM 與 DDR 混合
+* 目前層 Activation： 使用 FPGA 內部的 M10K Block (BRAM) 實作 Line Buffer 或 Tile Buffer，以支援卷積或矩陣乘法的滑動視窗操作
+* KV Cache：
+   * 由於 KV Cache 隨 Context Length 增長，FPGA BRAM 無法完全容納。
+   * 策略： KV Cache 存放於 DDR。HPS 負責管理 KV Cache 的物理位址與索引，FPGA 僅在 Attention 計算階段接收串流的 KV 資料。
+
+
+本提案利用 DE10-Nano 實作三元權重 (BitNet[a]) ，讓邊緣推論不再需要昂貴的 MAC 單元，透過將 LLM 推論轉化為 FPGA LUT 最擅長的位元級操作與加法樹，我們將 DSP 從「必需品」降級為「非必要資源」，不僅釋放 Cyclone V 的能耐，更為未來將大模型部署在低階 FPGA (如 Lattice iCE40, Gowin) 鋪平道路。換言之，本作品[b]證明「去 DSP 化」(DSP-Free) 是大模型邊緣應用的關鍵里程碑。
+
+
+	
+
+  
+  
+
+
+
+
+
+[a]參照 https://github.com/redoop/riscv-ai-accelerator 以提供系統架構圖，說明 HPS <--> FPGA 的互動 (RV32 included)

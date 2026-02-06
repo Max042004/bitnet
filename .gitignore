@@ -1,0 +1,25 @@
+# sbt build artifacts
+chisel/target/
+chisel/project/target/
+chisel/project/project/
+
+# Test run artifacts
+chisel/test_run_dir/
+
+# Generated Verilog (reproducible from source)
+chisel/generated/
+
+# IDE
+.idea/
+.vscode/
+.bsp/
+metals.sbt
+.metals/
+.bloop/
+
+# Reference repos (separate git repositories)
+reference/
+
+# OS
+.DS_Store
+Thumbs.db
