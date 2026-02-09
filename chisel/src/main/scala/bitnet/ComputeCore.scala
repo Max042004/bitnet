@@ -58,13 +58,20 @@ class ComputeCore(implicit val cfg: BitNetConfig) extends Module {
   // Accumulator
   val accumulator = RegInit(0.S(cfg.accumW.W))
 
-  // Pipeline for rowStart to align with adder tree output
-  val rowStartPipe = ShiftRegister(io.rowStart, cfg.treePipeStages)
+  // Flag: next valid adder tree output should replace (not add to) accumulator
+  val accumReset = RegInit(true.B)
 
-  when(rowStartPipe) {
-    accumulator := adderTree.io.sum
-  }.elsewhen(adderTree.io.valid_out) {
-    accumulator := accumulator + adderTree.io.sum
+  when(io.rowStart) {
+    accumReset := true.B
+  }
+
+  when(adderTree.io.valid_out) {
+    when(accumReset) {
+      accumulator := adderTree.io.sum
+      accumReset := false.B
+    }.otherwise {
+      accumulator := accumulator + adderTree.io.sum
+    }
   }
 
   io.accumOut := accumulator
