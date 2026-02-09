@@ -68,8 +68,9 @@ class BitNetAccelerator(implicit val cfg: BitNetConfig) extends Module {
   // Weight streamer defaults
   weightStr.io.start := false.B
   weightStr.io.baseAddr := controlRegs.io.weightBase
-  weightStr.io.dimM := controlRegs.io.dimM
   weightStr.io.dimK := controlRegs.io.dimK
+  weightStr.io.rowIdx := currentRow
+  weightStr.io.tileIdx := currentTile
 
   // Activation buffer tile control defaults
   actBuffer.io.tileOffset := currentTile << log2Ceil(cfg.numPEs).U
@@ -138,10 +139,6 @@ class BitNetAccelerator(implicit val cfg: BitNetConfig) extends Module {
           currentTile := nextTile
           state := sLoadTile
         }
-      }
-      when(weightStr.io.allDone) {
-        pipelineFlush := 0.U
-        state := sWaitPipeline
       }
     }
     is(sWaitPipeline) {
