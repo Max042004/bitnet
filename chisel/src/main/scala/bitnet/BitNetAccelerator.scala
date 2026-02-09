@@ -78,7 +78,7 @@ class BitNetAccelerator(implicit val cfg: BitNetConfig) extends Module {
 
   // Compute core connections
   computeCore.io.weightData := weightStr.io.weightData
-  computeCore.io.weightValid := weightStr.io.weightValid
+  computeCore.io.weightValid := false.B
   computeCore.io.activations := actBuffer.io.activations
   computeCore.io.dimK := dimK
   computeCore.io.shiftAmt := controlRegs.io.shiftAmt
@@ -128,6 +128,7 @@ class BitNetAccelerator(implicit val cfg: BitNetConfig) extends Module {
     }
     is(sStreamWeights) {
       // Wait for weight streamer to provide data
+      computeCore.io.weightValid := weightStr.io.weightValid
       computeCore.io.tileIn := weightStr.io.weightValid
       when(weightStr.io.weightValid) {
         val nextTile = currentTile + 1.U
