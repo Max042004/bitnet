@@ -117,13 +117,11 @@ class BitNetAccelerator(implicit val cfg: BitNetConfig) extends Module {
     is(sWaitTile) {
       when(actBuffer.io.tileReady) {
         // Start weight streamer for this row+tile
-        // Actually, we stream weights one row at a time
-        // For now: use simple approach - stream per tile
         state := sStreamWeights
         computeCore.io.rowStart := currentTile === 0.U
-        computeCore.io.tileIn := true.B
 
         // Issue Avalon read for this weight tile
+        // Do NOT assert tileIn here — wait for weightValid in sStreamWeights
         weightStr.io.start := true.B
       }
     }

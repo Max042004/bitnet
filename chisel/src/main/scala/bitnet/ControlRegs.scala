@@ -13,8 +13,8 @@ import chisel3.util._
   *   0x10  DIM_K        R/W  Input/reduction dimension
   *   0x14  SHIFT_AMT    R/W  Requantization right-shift
   *   0x18  PERF_CYCLES  R    Performance counter
-  *   0x80+ ACT_DATA     W    Activation buffer write (byte-addressed, stride 4)
-  *   0x100+ RES_DATA    R    Result buffer read (byte-addressed, stride 4)
+  *   0x80+  ACT_DATA    W    Activation buffer write (byte-addressed, stride 4, up to 0x47F)
+  *   0x800+ RES_DATA    R    Result buffer read (byte-addressed, stride 4)
   */
 class AvalonMMSlave(addrW: Int = 12, dataW: Int = 32) extends Bundle {
   val address   = Input(UInt(addrW.W))
@@ -66,9 +66,6 @@ class ControlRegs(implicit val cfg: BitNetConfig) extends Module {
   io.dimK      := regDimK
   io.shiftAmt  := regShiftAmt
 
-  // Default read data
-  io.avalon.readdata := 0.U
-
   // Activation write defaults
   io.actWriteEn   := false.B
   io.actWriteAddr := 0.U
@@ -95,29 +92,35 @@ class ControlRegs(implicit val cfg: BitNetConfig) extends Module {
       is(0x14.U) { regShiftAmt := io.avalon.writedata(4, 0) }
     }
 
-    // Activation data write: addresses 0x80 - 0xFF
-    when(addr >= 0x80.U && addr < 0x100.U) {
+    // Activation data write: addresses 0x80 - 0x47F (supports up to maxDimK entries)
+    when(addr >= 0x80.U && addr < 0x480.U) {
       io.actWriteEn   := true.B
       io.actWriteAddr := (addr - 0x80.U) >> 2
       io.actWriteData := io.avalon.writedata(cfg.activationW - 1, 0).asSInt
     }
   }
 
-  // Read logic
+  // Read logic (readLatency = 1: register outputs, BRAM has natural 1-cycle latency)
+  val regReadData = RegInit(0.U(32.W))
+  val readIsResult = RegNext(io.avalon.read && addr >= 0x800.U, false.B)
+
   when(io.avalon.read) {
+    // Combinational register reads — registered for readLatency=1
     switch(addr) {
-      is(0x04.U) { io.avalon.readdata := Cat(0.U(30.W), statusDone, io.busy) }
-      is(0x08.U) { io.avalon.readdata := regWeightBase }
-      is(0x0C.U) { io.avalon.readdata := regDimM }
-      is(0x10.U) { io.avalon.readdata := regDimK }
-      is(0x14.U) { io.avalon.readdata := regShiftAmt }
-      is(0x18.U) { io.avalon.readdata := io.perfCycles }
+      is(0x04.U) { regReadData := Cat(0.U(30.W), statusDone, io.busy) }
+      is(0x08.U) { regReadData := regWeightBase }
+      is(0x0C.U) { regReadData := regDimM }
+      is(0x10.U) { regReadData := regDimK }
+      is(0x14.U) { regReadData := regShiftAmt }
+      is(0x18.U) { regReadData := io.perfCycles }
     }
 
-    // Result data read: addresses 0x100+
-    when(addr >= 0x100.U) {
-      io.resReadAddr := (addr - 0x100.U) >> 2
-      io.avalon.readdata := io.resReadData.asUInt
+    // Result buffer read: present address to SyncReadMem (output arrives next cycle)
+    when(addr >= 0x800.U) {
+      io.resReadAddr := (addr - 0x800.U) >> 2
     }
   }
+
+  // Output mux: BRAM data for result reads, registered data for register reads
+  io.avalon.readdata := Mux(readIsResult, io.resReadData.asUInt, regReadData)
 }
