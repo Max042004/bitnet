@@ -13,10 +13,10 @@ import chisel3.util._
   *   0x10  DIM_K        R/W  Input/reduction dimension
   *   0x14  SHIFT_AMT    R/W  Requantization right-shift
   *   0x18  PERF_CYCLES  R    Performance counter
-  *   0x80+  ACT_DATA    W    Activation buffer write (byte-addressed, stride 4, up to 0x47F)
-  *   0x800+ RES_DATA    R    Result buffer read (byte-addressed, stride 4)
+  *   0x80+  ACT_DATA    W    Activation buffer write (byte-addressed, stride 4, up to maxDimK entries)
+  *   0x2000+ RES_DATA   R    Result buffer read (byte-addressed, stride 4)
   */
-class AvalonMMSlave(addrW: Int = 12, dataW: Int = 32) extends Bundle {
+class AvalonMMSlave(addrW: Int = 14, dataW: Int = 32) extends Bundle {
   val address   = Input(UInt(addrW.W))
   val read      = Input(Bool())
   val write     = Input(Bool())
@@ -92,8 +92,8 @@ class ControlRegs(implicit val cfg: BitNetConfig) extends Module {
       is(0x14.U) { regShiftAmt := io.avalon.writedata(4, 0) }
     }
 
-    // Activation data write: addresses 0x80 - 0x47F (supports up to maxDimK entries)
-    when(addr >= 0x80.U && addr < 0x480.U) {
+    // Activation data write: addresses 0x80 to 0x80 + (maxDimK-1)*4
+    when(addr >= 0x80.U && addr < (0x80 + cfg.maxDimK * 4).U) {
       io.actWriteEn   := true.B
       io.actWriteAddr := (addr - 0x80.U) >> 2
       io.actWriteData := io.avalon.writedata(cfg.activationW - 1, 0).asSInt
@@ -102,7 +102,7 @@ class ControlRegs(implicit val cfg: BitNetConfig) extends Module {
 
   // Read logic (readLatency = 1: register outputs, BRAM has natural 1-cycle latency)
   val regReadData = RegInit(0.U(32.W))
-  val readIsResult = RegNext(io.avalon.read && addr >= 0x800.U, false.B)
+  val readIsResult = RegNext(io.avalon.read && addr >= 0x2000.U, false.B)
 
   when(io.avalon.read) {
     // Combinational register reads — registered for readLatency=1
@@ -116,8 +116,8 @@ class ControlRegs(implicit val cfg: BitNetConfig) extends Module {
     }
 
     // Result buffer read: present address to SyncReadMem (output arrives next cycle)
-    when(addr >= 0x800.U) {
-      io.resReadAddr := (addr - 0x800.U) >> 2
+    when(addr >= 0x2000.U) {
+      io.resReadAddr := (addr - 0x2000.U) >> 2
     }
   }
 
