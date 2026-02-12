@@ -3,14 +3,13 @@ package bitnet
 import chisel3._
 import chisel3.util._
 
-/** BRAM-backed activation buffer with parallel read for the PE array.
+/** Banked BRAM activation buffer with parallel read for the PE array.
   *
-  * Supports:
-  * - Sequential write from HPS (one INT8 activation per cycle)
-  * - Parallel read of numPEs activations for the current tile
+  * Uses numPEs independent BRAM banks (bank-interleaved layout) to enable
+  * parallel read of all numPEs activations in 2 cycles (1 issue + 1 latency),
+  * replacing the original sequential 65-cycle load.
   *
-  * Stores up to maxDimK activations. The tile register file loads
-  * numPEs activations from BRAM for the current tile offset.
+  * Bank layout: activation[i] → bank[i % numPEs] at address i / numPEs
   */
 class ActivationBuffer(implicit val cfg: BitNetConfig) extends Module {
   val io = IO(new Bundle {
@@ -28,27 +27,35 @@ class ActivationBuffer(implicit val cfg: BitNetConfig) extends Module {
     val activations = Output(Vec(cfg.numPEs, SInt(cfg.activationW.W)))
   })
 
-  // BRAM storage for activations
-  val mem = SyncReadMem(cfg.maxDimK, SInt(cfg.activationW.W))
+  val numBanks  = cfg.numPEs
+  val bankDepth = cfg.maxDimK / cfg.numPEs
+  val bankSelW  = log2Ceil(numBanks)
+
+  // 64 independent BRAM banks (bank-interleaved: act[i] in bank[i % numPEs])
+  val banks = Seq.fill(numBanks)(SyncReadMem(bankDepth, SInt(cfg.activationW.W)))
 
   // Tile register file — holds numPEs activations for parallel read
   val tileRegs = RegInit(VecInit(Seq.fill(cfg.numPEs)(0.S(cfg.activationW.W))))
 
-  // State machine for tile loading
+  // FSM states
   val sReady :: sLoading :: Nil = Enum(2)
   val state = RegInit(sReady)
-  val loadIdx = RegInit(0.U(log2Ceil(cfg.numPEs + 1).W))
-  val baseAddr = RegInit(0.U(cfg.dimW.W))
 
-  // BRAM read address
-  val readAddr = Wire(UInt(cfg.dimW.W))
-  readAddr := baseAddr + loadIdx
-  val readData = mem.read(readAddr)
+  // --- Write path (HPS writes, bank-interleaved) ---
+  // Activation i → bank[i % numPEs] at address i / numPEs
+  val writeBankSel  = io.writeAddr(bankSelW - 1, 0)
+  val writeBankAddr = io.writeAddr >> bankSelW
 
-  // Write port
-  when(io.writeEn) {
-    mem.write(io.writeAddr, io.writeData)
+  for (b <- 0 until numBanks) {
+    when(io.writeEn && writeBankSel === b.U) {
+      banks(b).write(writeBankAddr, io.writeData)
+    }
   }
+
+  // --- Read path (parallel tile load, 2 cycles) ---
+  // tileOffset = currentTile << log2(numPEs), so tileIndex = currentTile
+  val tileIndex = io.tileOffset >> bankSelW
+  val readData  = VecInit(banks.map(_.read(tileIndex)))
 
   io.tileReady := state === sReady
 
@@ -56,20 +63,16 @@ class ActivationBuffer(implicit val cfg: BitNetConfig) extends Module {
     is(sReady) {
       when(io.tileLoad) {
         state := sLoading
-        loadIdx := 0.U
-        baseAddr := io.tileOffset
+        // All 64 banks sample tileIndex this cycle;
+        // SyncReadMem data will be valid next cycle
       }
     }
     is(sLoading) {
-      // SyncReadMem has 1-cycle read latency, so we capture data at loadIdx-1
-      when(loadIdx > 0.U) {
-        tileRegs((loadIdx - 1.U)(log2Ceil(cfg.numPEs) - 1, 0)) := readData
+      // Capture SyncReadMem output (1-cycle latency from read in sReady)
+      for (b <- 0 until numBanks) {
+        tileRegs(b) := readData(b)
       }
-      when(loadIdx === cfg.numPEs.U) {
-        state := sReady
-      }.otherwise {
-        loadIdx := loadIdx + 1.U
-      }
+      state := sReady
     }
   }
 

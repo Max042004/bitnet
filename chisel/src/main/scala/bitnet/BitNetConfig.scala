@@ -23,6 +23,7 @@ case class BitNetConfig(
 ) {
   require(isPow2(numPEs), "numPEs must be a power of 2")
   require(avalonDataW >= numPEs * 2, "Avalon data bus must fit all PE weight bits")
+  require(maxDimK % numPEs == 0, "maxDimK must be divisible by numPEs for banked activation buffer")
 
   /** Bit width for PE output (activation + 1 for sign inversion overflow) */
   val peOutW: Int = activationW + 1
