@@ -20,6 +20,9 @@ metals.sbt
 # Reference repos (separate git repositories)
 reference/
 
+# Downloaded datasets
+python/data/
+
 # OS
 .DS_Store
 Thumbs.db
