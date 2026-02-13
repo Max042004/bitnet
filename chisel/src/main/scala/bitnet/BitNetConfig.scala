@@ -32,8 +32,8 @@ case class BitNetConfig(
   /** Adder tree output width: peOutW + treeDepth bits for accumulation growth */
   val treeOutW: Int = peOutW + treeDepth
 
-  /** Number of pipeline stages in adder tree (one register every 2 levels) */
-  val treePipeStages: Int = (treeDepth + 1) / 2
+  /** Number of pipeline stages in adder tree (one register per level) */
+  val treePipeStages: Int = treeDepth
 
   /** Number of tiles needed for K dimension = ceil(K / numPEs) */
   def tilesK(k: Int): Int = (k + numPEs - 1) / numPEs

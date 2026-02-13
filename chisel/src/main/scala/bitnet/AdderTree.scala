@@ -4,10 +4,10 @@ import chisel3._
 
 /** Pipelined binary adder tree reducing numPEs inputs to one sum.
   *
-  * 64→32→16 [REG] →8→4 [REG] →2→1 [REG]
+  * 128 [REG] →64 [REG] →32 [REG] →16 [REG] →8 [REG] →4 [REG] →2 [REG] →1
   *
-  * Pipeline register inserted every 2 levels.
-  * Total latency = treePipeStages cycles.
+  * Pipeline register inserted at every level to meet timing at 100 MHz.
+  * Total latency = treeDepth cycles.
   * Output sign-extended to accumW bits.
   */
 class AdderTree(implicit val cfg: BitNetConfig) extends Module {
@@ -27,19 +27,15 @@ class AdderTree(implicit val cfg: BitNetConfig) extends Module {
 
   var validPipe = io.valid_in
 
-  for (level <- 0 until cfg.treeDepth) {
+  for (_ <- 0 until cfg.treeDepth) {
     val half = current.length / 2
     val next = (0 until half).map { i =>
       current(2 * i) +& current(2 * i + 1)
     }
 
-    // Insert pipeline register every 2 levels
-    if ((level % 2 == 1) || (level == cfg.treeDepth - 1)) {
-      current = next.map(x => RegNext(x))
-      validPipe = RegNext(validPipe, false.B)
-    } else {
-      current = next
-    }
+    // Pipeline register at every level for timing closure at 100 MHz
+    current = next.map(x => RegNext(x))
+    validPipe = RegNext(validPipe, false.B)
   }
 
   io.sum := current.head
