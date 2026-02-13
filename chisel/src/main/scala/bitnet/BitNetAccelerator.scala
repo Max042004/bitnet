@@ -16,7 +16,7 @@ class BitNetAccelerator(implicit val cfg: BitNetConfig) extends Module {
     val slave = new AvalonMMSlave()
 
     // Avalon-MM master (DDR3 weight reads)
-    val master = new AvalonMMReadMaster(cfg.avalonAddrW, cfg.avalonDataW)
+    val master = new AvalonMMReadMaster(cfg.avalonAddrW, cfg.avalonDataW, cfg.burstCountW)
   })
 
   // Sub-modules
@@ -48,7 +48,7 @@ class BitNetAccelerator(implicit val cfg: BitNetConfig) extends Module {
   controlRegs.io.resReadData := resReadData
 
   // ---- Main FSM ----
-  val sIdle :: sLoadTile :: sWaitTile :: sStreamWeights :: sWaitPipeline :: sRowNext :: sDone :: Nil = Enum(7)
+  val sIdle :: sStartRow :: sLoadTile :: sWaitTile :: sConsumeWeight :: sWaitPipeline :: sRowNext :: sDone :: Nil = Enum(8)
   val state = RegInit(sIdle)
 
   val currentRow = RegInit(0.U(cfg.dimW.W))
@@ -66,11 +66,11 @@ class BitNetAccelerator(implicit val cfg: BitNetConfig) extends Module {
   controlRegs.io.perfCycles := perfCycles
 
   // Weight streamer defaults
-  weightStr.io.start := false.B
+  weightStr.io.startRow := false.B
   weightStr.io.baseAddr := controlRegs.io.weightBase
   weightStr.io.dimK := controlRegs.io.dimK
   weightStr.io.rowIdx := currentRow
-  weightStr.io.tileIdx := currentTile
+  weightStr.io.dequeue := false.B
 
   // Activation buffer tile control defaults
   actBuffer.io.tileOffset := currentTile << log2Ceil(cfg.numPEs).U
@@ -106,8 +106,13 @@ class BitNetAccelerator(implicit val cfg: BitNetConfig) extends Module {
         currentTile := 0.U
         resultWriteIdx := 0.U
         perfCycles := 0.U
-        state := sLoadTile
+        state := sStartRow
       }
+    }
+    is(sStartRow) {
+      // Issue one burst read for the entire row
+      weightStr.io.startRow := true.B
+      state := sLoadTile
     }
     is(sLoadTile) {
       // Request tile load from activation buffer
@@ -117,20 +122,16 @@ class BitNetAccelerator(implicit val cfg: BitNetConfig) extends Module {
     }
     is(sWaitTile) {
       when(actBuffer.io.tileReady) {
-        // Start weight streamer for this row+tile
-        state := sStreamWeights
         computeCore.io.rowStart := currentTile === 0.U
-
-        // Issue Avalon read for this weight tile
-        // Do NOT assert tileIn here — wait for weightValid in sStreamWeights
-        weightStr.io.start := true.B
+        state := sConsumeWeight
       }
     }
-    is(sStreamWeights) {
-      // Wait for weight streamer to provide data
-      computeCore.io.weightValid := weightStr.io.weightValid
-      computeCore.io.tileIn := weightStr.io.weightValid
-      when(weightStr.io.weightValid) {
+    is(sConsumeWeight) {
+      // Wait for FIFO to have data, then dequeue and feed compute core
+      when(weightStr.io.dataReady) {
+        weightStr.io.dequeue := true.B
+        computeCore.io.weightValid := true.B
+        computeCore.io.tileIn := true.B
         val nextTile = currentTile + 1.U
         when(nextTile >= tilesPerRow) {
           // All tiles for this row done, wait for pipeline
@@ -156,7 +157,7 @@ class BitNetAccelerator(implicit val cfg: BitNetConfig) extends Module {
       }.otherwise {
         currentRow := nextRow
         currentTile := 0.U
-        state := sLoadTile
+        state := sStartRow
       }
     }
     is(sDone) {

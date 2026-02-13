@@ -52,24 +52,42 @@ class BitNetAcceleratorTest extends AnyFlatSpec with ChiselScalatestTester {
     packed
   }
 
-  /** Simulate accelerator with DDR3 memory model responding to Avalon master reads */
+  /** Simulate accelerator with DDR3 burst memory model responding to Avalon master reads.
+    * Captures address + burstcount when read is asserted, then delivers
+    * back-to-back beats with 1-cycle initial latency.
+    */
   def runWithMemory(dut: BitNetAccelerator, weightMem: Map[Int, BigInt], cycles: Int): Unit = {
-    var pendingRead = false
-    var pendingData = BigInt(0)
+    val bytesPerBeat = cfg.avalonDataW / 8
+    var burstAddr = 0
+    var burstRemaining = 0
+    var newBurstPending = false
+    var newBurstAddr = 0
+    var newBurstLen = 0
 
     for (_ <- 0 until cycles) {
-      if (pendingRead) {
+      // Start delivering a burst captured last cycle
+      if (newBurstPending) {
+        burstAddr = newBurstAddr
+        burstRemaining = newBurstLen
+        newBurstPending = false
+      }
+
+      // Deliver burst data
+      if (burstRemaining > 0) {
         dut.io.master.readdatavalid.poke(true.B)
-        dut.io.master.readdata.poke(pendingData.U)
-        pendingRead = false
+        val data = weightMem.getOrElse(burstAddr, BigInt(0))
+        dut.io.master.readdata.poke(data.U)
+        burstAddr += bytesPerBeat
+        burstRemaining -= 1
       } else {
         dut.io.master.readdatavalid.poke(false.B)
       }
 
+      // Capture new burst read request
       if (dut.io.master.read.peek().litToBoolean) {
-        val addr = dut.io.master.address.peek().litValue.toInt
-        pendingData = weightMem.getOrElse(addr, BigInt(0))
-        pendingRead = true
+        newBurstAddr = dut.io.master.address.peek().litValue.toInt
+        newBurstLen = dut.io.master.burstcount.peek().litValue.toInt
+        newBurstPending = true
       }
 
       dut.clock.step(1)

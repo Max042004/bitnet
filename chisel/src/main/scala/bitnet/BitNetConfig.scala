@@ -7,7 +7,6 @@ package bitnet
   * @param accumW        Bit width of accumulator
   * @param avalonDataW   Avalon-MM data bus width
   * @param avalonAddrW   Avalon-MM address bus width
-  * @param burstLen      Avalon-MM burst length (beats)
   * @param maxDimM       Maximum output dimension M
   * @param maxDimK       Maximum reduction dimension K
   */
@@ -17,7 +16,6 @@ case class BitNetConfig(
   accumW:       Int = 20,
   avalonDataW:  Int = 128,
   avalonAddrW:  Int = 32,
-  burstLen:     Int = 1,
   maxDimM:      Int = 1024,
   maxDimK:      Int = 1024
 ) {
@@ -39,6 +37,9 @@ case class BitNetConfig(
 
   /** Number of tiles needed for K dimension = ceil(K / numPEs) */
   def tilesK(k: Int): Int = (k + numPEs - 1) / numPEs
+
+  /** Avalon-MM burst count width: enough bits to represent maxDimK/numPEs */
+  val burstCountW: Int = log2Ceil(maxDimK / numPEs) + 1
 
   /** Dimension register width */
   val dimW: Int = log2Ceil(maxDimK + 1).max(log2Ceil(maxDimM + 1))
