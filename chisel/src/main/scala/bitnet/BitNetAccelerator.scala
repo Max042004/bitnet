@@ -9,6 +9,9 @@ import chisel3.util._
   *   HPS ──Avalon-MM Slave──► ControlRegs ──► FSM
   *   DDR3 ◄──Avalon-MM Master── WeightStreamer ◄── FSM
   *   ActivationBuffer ──► ComputeCore (Decoder→PEArray→AdderTree→Accum→Requant) ──► ResultBuffer
+  *
+  * Weight prefetch: double-buffered WeightStreamer allows overlapping DDR3
+  * reads for row N+1 while row N is being computed, hiding DDR3 latency.
   */
 class BitNetAccelerator(implicit val cfg: BitNetConfig) extends Module {
   val io = IO(new Bundle {
@@ -48,7 +51,7 @@ class BitNetAccelerator(implicit val cfg: BitNetConfig) extends Module {
   controlRegs.io.resReadData := resReadData
 
   // ---- Main FSM ----
-  val sIdle :: sStartRow :: sLoadTile :: sWaitTile :: sConsumeWeight :: sWaitPipeline :: sRowNext :: sDone :: Nil = Enum(8)
+  val sIdle :: sStartRow :: sWaitFill :: sSwapAndGo :: sStartPrefetch :: sLoadTile :: sWaitTile :: sConsumeWeight :: sWaitPipeline :: sRowNext :: sDone :: Nil = Enum(11)
   val state = RegInit(sIdle)
 
   val currentRow = RegInit(0.U(cfg.dimW.W))
@@ -71,6 +74,7 @@ class BitNetAccelerator(implicit val cfg: BitNetConfig) extends Module {
   weightStr.io.dimK := controlRegs.io.dimK
   weightStr.io.rowIdx := currentRow
   weightStr.io.dequeue := false.B
+  weightStr.io.swap := false.B
 
   // Activation buffer tile control defaults
   actBuffer.io.tileOffset := currentTile << log2Ceil(cfg.numPEs).U
@@ -110,8 +114,31 @@ class BitNetAccelerator(implicit val cfg: BitNetConfig) extends Module {
       }
     }
     is(sStartRow) {
-      // Issue one burst read for the entire row
+      // Fill the fill-side FIFO with the first row
       weightStr.io.startRow := true.B
+      weightStr.io.rowIdx := currentRow
+      state := sWaitFill
+    }
+    is(sWaitFill) {
+      // Wait for the fill-side FIFO to finish loading
+      when(weightStr.io.prefetchDone) {
+        state := sSwapAndGo
+      }
+    }
+    is(sSwapAndGo) {
+      // Swap: make the filled FIFO the active one
+      weightStr.io.swap := true.B
+      currentTile := 0.U
+      // Start prefetch on next cycle (after swap register updates)
+      state := sStartPrefetch
+    }
+    is(sStartPrefetch) {
+      // Now activeBuf has been updated, so startRow fills the correct FIFO
+      val nextRow = currentRow + 1.U
+      when(nextRow < totalRows) {
+        weightStr.io.startRow := true.B
+        weightStr.io.rowIdx := nextRow
+      }
       state := sLoadTile
     }
     is(sLoadTile) {
@@ -157,7 +184,13 @@ class BitNetAccelerator(implicit val cfg: BitNetConfig) extends Module {
       }.otherwise {
         currentRow := nextRow
         currentTile := 0.U
-        state := sStartRow
+        // Prefetch was already started in sSwapAndGo.
+        // Check if it's done; if so, swap immediately, otherwise wait.
+        when(weightStr.io.prefetchDone) {
+          state := sSwapAndGo
+        }.otherwise {
+          state := sWaitFill
+        }
       }
     }
     is(sDone) {
