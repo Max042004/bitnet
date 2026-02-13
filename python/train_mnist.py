@@ -213,8 +213,8 @@ def export_weights_header(model, shifts, filepath):
 
         # 2-bit packed weight arrays (uint32_t, for DDR3/FPGA)
         for name, w, k, m, shift in layers:
-            tiles_per_row = (k + 63) // 64
-            total_words = m * tiles_per_row * 4  # 4 uint32 per 128-bit beat
+            tiles_per_row = (k + 127) // 128
+            total_words = m * tiles_per_row * 8  # 8 uint32 per 256-bit beat
             f.write(f"/* {name}: 2-bit packed weights for DDR3 "
                     f"({m} rows x {tiles_per_row} tiles x 4 words) */\n")
             f.write(f"static const uint32_t {name.lower()}_packed[{total_words}] = {{\n")
@@ -222,9 +222,9 @@ def export_weights_header(model, shifts, filepath):
             word_list = []
             for row in range(m):
                 for tile in range(tiles_per_row):
-                    packed = [0, 0, 0, 0]
-                    for i in range(64):
-                        col = tile * 64 + i
+                    packed = [0, 0, 0, 0, 0, 0, 0, 0]
+                    for i in range(128):
+                        col = tile * 128 + i
                         val = int(w[row, col]) if col < k else 0
                         if val == 1:
                             enc = 0x1
@@ -247,8 +247,8 @@ def export_weights_header(model, shifts, filepath):
         # DDR3 byte sizes for each layer (for computing offsets)
         f.write("/* DDR3 byte sizes per layer (for offset computation) */\n")
         for name, w, k, m, shift in layers:
-            tiles_per_row = (k + 63) // 64
-            byte_size = m * tiles_per_row * 16  # 16 bytes per 128-bit beat
+            tiles_per_row = (k + 127) // 128
+            byte_size = m * tiles_per_row * 32  # 32 bytes per 256-bit beat
             f.write(f"#define {name}_DDR3_BYTES {byte_size}\n")
         f.write("\n")
 

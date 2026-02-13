@@ -5,7 +5,7 @@ import chiseltest._
 import org.scalatest.flatspec.AnyFlatSpec
 
 class WeightStreamerTest extends AnyFlatSpec with ChiselScalatestTester {
-  implicit val cfg: BitNetConfig = BitNetConfig()
+  implicit val cfg: BitNetConfig = BitNetConfig(numPEs = 64, avalonDataW = 128)
 
   /** Helper: fill the fill-side FIFO, then swap to make it active.
     * This replaces the old single-FIFO startRow pattern.

@@ -166,7 +166,10 @@ class BitNetAccelerator(implicit val cfg: BitNetConfig) extends Module {
           state := sWaitPipeline
         }.otherwise {
           currentTile := nextTile
-          state := sLoadTile
+          // Trigger next tile load here instead of going to sLoadTile
+          actBuffer.io.tileLoad := true.B
+          actBuffer.io.tileOffset := nextTile << log2Ceil(cfg.numPEs).U
+          state := sWaitTile
         }
       }
     }

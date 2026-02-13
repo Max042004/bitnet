@@ -11,10 +11,10 @@ package bitnet
   * @param maxDimK       Maximum reduction dimension K
   */
 case class BitNetConfig(
-  numPEs:       Int = 64,
+  numPEs:       Int = 128,
   activationW:  Int = 8,
   accumW:       Int = 20,
-  avalonDataW:  Int = 128,
+  avalonDataW:  Int = 256,
   avalonAddrW:  Int = 32,
   maxDimM:      Int = 1024,
   maxDimK:      Int = 1024

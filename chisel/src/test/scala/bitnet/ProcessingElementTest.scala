@@ -5,7 +5,7 @@ import chiseltest._
 import org.scalatest.flatspec.AnyFlatSpec
 
 class ProcessingElementTest extends AnyFlatSpec with ChiselScalatestTester {
-  implicit val cfg: BitNetConfig = BitNetConfig()
+  implicit val cfg: BitNetConfig = BitNetConfig(numPEs = 64, avalonDataW = 128)
 
   behavior of "ProcessingElement"
 
