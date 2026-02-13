@@ -36,7 +36,7 @@ class ComputeCoreTest extends AnyFlatSpec with ChiselScalatestTester {
       dut.io.weightValid.poke(false.B)
 
       // Wait for pipeline to flush
-      dut.clock.step(cfg.treePipeStages + 3)
+      dut.clock.step(cfg.treePipeStages + 4)
 
       // Check accumulator output
       val accumVal = dut.io.accumOut.peek().litValue.toInt
@@ -74,7 +74,7 @@ class ComputeCoreTest extends AnyFlatSpec with ChiselScalatestTester {
       dut.io.tileIn.poke(false.B)
       dut.io.weightValid.poke(false.B)
 
-      dut.clock.step(cfg.treePipeStages + 3)
+      dut.clock.step(cfg.treePipeStages + 4)
 
       val accumVal = dut.io.accumOut.peek().litValue.toInt
       println(s"Accumulator value: $accumVal (expected: 0)")
@@ -108,7 +108,7 @@ class ComputeCoreTest extends AnyFlatSpec with ChiselScalatestTester {
       dut.io.weightValid.poke(false.B)
 
       // Wait for pipeline
-      dut.clock.step(cfg.treePipeStages + 1)
+      dut.clock.step(cfg.treePipeStages + 2)
 
       // Tile 1
       dut.io.tileIn.poke(true.B)
@@ -119,7 +119,7 @@ class ComputeCoreTest extends AnyFlatSpec with ChiselScalatestTester {
       dut.io.weightValid.poke(false.B)
 
       // Wait for second tile
-      dut.clock.step(cfg.treePipeStages + 3)
+      dut.clock.step(cfg.treePipeStages + 4)
 
       val accumVal = dut.io.accumOut.peek().litValue.toInt
       println(s"Accumulator value: $accumVal (expected: ${cfg.numPEs * 2})")

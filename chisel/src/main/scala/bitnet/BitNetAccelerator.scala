@@ -51,7 +51,7 @@ class BitNetAccelerator(implicit val cfg: BitNetConfig) extends Module {
   controlRegs.io.resReadData := resReadData
 
   // ---- Main FSM ----
-  val sIdle :: sStartRow :: sWaitFill :: sSwapAndGo :: sStartPrefetch :: sLoadTile :: sWaitTile :: sConsumeWeight :: sWaitPipeline :: sRowNext :: sDone :: Nil = Enum(11)
+  val sIdle :: sStartRow :: sWaitFill :: sSwapAndGo :: sStartPrefetch :: sLoadTile :: sWaitTile :: sConsumeWeight :: sWaitOne :: sWaitPipeline :: sRowNext :: sDone :: Nil = Enum(12)
   val state = RegInit(sIdle)
 
   val currentRow = RegInit(0.U(cfg.dimW.W))
@@ -169,14 +169,19 @@ class BitNetAccelerator(implicit val cfg: BitNetConfig) extends Module {
           // Trigger next tile load here instead of going to sLoadTile
           actBuffer.io.tileLoad := true.B
           actBuffer.io.tileOffset := nextTile << log2Ceil(cfg.numPEs).U
-          state := sWaitTile
+          state := sWaitOne
         }
       }
+    }
+    is(sWaitOne) {
+      // Fixed 1-cycle wait for activation buffer BRAM read.
+      // tileRegs will be valid at start of next cycle.
+      state := sConsumeWeight
     }
     is(sWaitPipeline) {
       // Wait for adder tree pipeline + requantize to flush
       pipelineFlush := pipelineFlush + 1.U
-      when(pipelineFlush >= (cfg.treePipeStages + 2).U) {
+      when(pipelineFlush >= (cfg.treePipeStages + 3).U) {
         state := sRowNext
       }
     }

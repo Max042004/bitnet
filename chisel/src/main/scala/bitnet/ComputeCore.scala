@@ -50,10 +50,17 @@ class ComputeCore(implicit val cfg: BitNetConfig) extends Module {
   peArray.io.enables := decoder.io.enable
   peArray.io.signs := decoder.io.sign
 
+  // Pipeline register between PE array and adder tree.
+  // Breaks the critical path: FIFO → decode → PE → adder_L0-L1
+  val peRegs = Reg(Vec(cfg.numPEs, SInt(cfg.peOutW.W)))
+  val peValidReg = RegInit(false.B)
+  peRegs := peArray.io.results
+  peValidReg := io.weightValid
+
   // Adder tree
   val adderTree = Module(new AdderTree)
-  adderTree.io.inputs := peArray.io.results
-  adderTree.io.valid_in := io.weightValid
+  adderTree.io.inputs := peRegs
+  adderTree.io.valid_in := peValidReg
 
   // Accumulator
   val accumulator = RegInit(0.S(cfg.accumW.W))
