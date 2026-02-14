@@ -94,10 +94,10 @@ class BitNetAcceleratorTest extends AnyFlatSpec with ChiselScalatestTester {
     }
   }
 
-  /** Read INT8 result from result buffer, sign-extending to Int */
+  /** Read raw 32-bit accumulator result from result buffer, sign-extending to Int */
   def readResult(dut: BitNetAccelerator, row: Int): Int = {
-    val raw = readReg(dut, 0x2000 + row * 4)
-    if (raw > 127) (raw - 256).toInt else raw.toInt
+    val raw = readReg(dut, 0x4000 + row * 4)
+    if (raw > 0x7FFFFFFFL) (raw - 0x100000000L).toInt else raw.toInt
   }
 
   /** Write an INT8 activation value (handles negative values via unsigned conversion) */
@@ -105,11 +105,9 @@ class BitNetAcceleratorTest extends AnyFlatSpec with ChiselScalatestTester {
     writeReg(dut, 0x80 + idx * 4, BigInt(value & 0xFF))
   }
 
-  /** Software reference model: dot product → arithmetic right shift → clamp to [-128,+127] */
-  def refModel(weights: Seq[Int], acts: Seq[Int], shift: Int): Int = {
-    val dot = weights.zip(acts).map { case (w, a) => w * a }.sum
-    val shifted = dot >> shift
-    math.max(-128, math.min(127, shifted))
+  /** Software reference model: raw dot product (no shift/clamp — FPGA outputs raw accumulator) */
+  def refModel(weights: Seq[Int], acts: Seq[Int]): Int = {
+    weights.zip(acts).map { case (w, a) => w * a }.sum
   }
 
   it should "accept register writes and reads" in {
@@ -292,7 +290,7 @@ class BitNetAcceleratorTest extends AnyFlatSpec with ChiselScalatestTester {
   it should "compute M=1 with K=1024 (256 tiles, max-K deep accumulation)" in {
     // Uses a config with maxDimK=1024 to exercise the full activation address range.
     // Every 4th weight = +1, rest 0. All activations = 4.
-    // Per tile: [+1,0,0,0] · [4,4,4,4] = 4.  256 tiles × 4 = 1024.  1024 >> 4 = 64.
+    // Per tile: [+1,0,0,0] · [4,4,4,4] = 4.  256 tiles × 4 = 1024 (raw accumulator).
     val largeCfg = BitNetConfig(
       numPEs = 4,
       maxDimM = 16,
@@ -325,15 +323,15 @@ class BitNetAcceleratorTest extends AnyFlatSpec with ChiselScalatestTester {
       assert((status & 2) != 0, s"Expected DONE, got status=0x${status.toString(16)}")
 
       val result = readResult(dut, 0)
-      assert(result == 64, s"Expected 64, got $result")
+      assert(result == 1024, s"Expected 1024, got $result")
     }
   }
 
-  it should "compute M=2 multi-row with requantization shift" in {
+  it should "compute M=2 multi-row (shift register ignored — raw accumulator output)" in {
     test(new BitNetAccelerator) { dut =>
-      // M=2, K=4, shift=2. Activations=[4,4,4,4]
-      // Row 0: all +1 → sum=16, >>2 = 4
-      // Row 1: all -1 → sum=-16, >>2 = -4
+      // M=2, K=4. Activations=[4,4,4,4]
+      // Row 0: all +1 → sum=16 (raw accumulator)
+      // Row 1: all -1 → sum=-16 (raw accumulator)
       val weightBase = 0x4000
       val weightMem = Map(
         0x4000 -> packWeights(Seq(1, 1, 1, 1)),
@@ -348,7 +346,7 @@ class BitNetAcceleratorTest extends AnyFlatSpec with ChiselScalatestTester {
       writeReg(dut, 0x08, weightBase)
       writeReg(dut, 0x0C, 2)  // M
       writeReg(dut, 0x10, 4)  // K
-      writeReg(dut, 0x14, 2)  // shift
+      writeReg(dut, 0x14, 2)  // shift (ignored)
       writeReg(dut, 0x00, 1)  // START
 
       runWithMemory(dut, weightMem, 200)
@@ -358,8 +356,8 @@ class BitNetAcceleratorTest extends AnyFlatSpec with ChiselScalatestTester {
 
       val r0 = readResult(dut, 0)
       val r1 = readResult(dut, 1)
-      assert(r0 == 4, s"Row 0: expected 4, got $r0")
-      assert(r1 == -4, s"Row 1: expected -4, got $r1")
+      assert(r0 == 16, s"Row 0: expected 16, got $r0")
+      assert(r1 == -16, s"Row 1: expected -16, got $r1")
     }
   }
 
@@ -477,10 +475,10 @@ class BitNetAcceleratorTest extends AnyFlatSpec with ChiselScalatestTester {
 
   // ---- G: Shift amount sweep ----
 
-  it should "G1: shift amount sweep 0-7 with known accumulator value" in {
+  it should "G1: raw accumulator output is consistent across shift register values" in {
     test(new BitNetAccelerator) { dut =>
       dut.clock.setTimeout(0)
-      // M=1, K=16, all +1, act=4. acc=4*16=64. Sweep shift 0→7.
+      // M=1, K=16, all +1, act=4. acc=4*16=64. Raw output should be 64 regardless of shift.
       val weightBase = 0x7000
       val weightMem = (0 until 4).map(t =>
         (weightBase + t) -> packWeights(Seq(1, 1, 1, 1))
@@ -495,9 +493,8 @@ class BitNetAcceleratorTest extends AnyFlatSpec with ChiselScalatestTester {
       writeReg(dut, 0x0C, 1)   // M
       writeReg(dut, 0x10, 16)  // K
 
-      val expectedResults = Seq(64, 32, 16, 8, 4, 2, 1, 0)
       for (shift <- 0 until 8) {
-        writeReg(dut, 0x14, shift)  // shift
+        writeReg(dut, 0x14, shift)  // shift (ignored — raw output)
         writeReg(dut, 0x00, 1)     // START
 
         runWithMemory(dut, weightMem, 300)
@@ -507,17 +504,17 @@ class BitNetAcceleratorTest extends AnyFlatSpec with ChiselScalatestTester {
           s"Shift=$shift: Expected DONE, got status=0x${status.toString(16)}")
 
         val r0 = readResult(dut, 0)
-        assert(r0 == expectedResults(shift),
-          s"Shift=$shift: expected ${expectedResults(shift)}, got $r0")
+        assert(r0 == 64,
+          s"Shift=$shift: expected raw accumulator 64, got $r0")
       }
     }
   }
 
   // ---- H: End-to-end clamping tests ----
 
-  it should "H1: clamp large negative accumulator to -128" in {
+  it should "H1: raw accumulator for large negative value (no clamping)" in {
     test(new BitNetAccelerator) { dut =>
-      // all -1 × act=100 → acc=-400 → clamp -128
+      // all -1 × act=100 → acc=-400 (raw, no clamp)
       val weightBase = 0x8000
       val weightMem = Map(0x8000 -> packWeights(Seq(-1, -1, -1, -1)))
 
@@ -538,7 +535,7 @@ class BitNetAcceleratorTest extends AnyFlatSpec with ChiselScalatestTester {
       assert((status & 2) != 0, s"Expected DONE, got status=0x${status.toString(16)}")
 
       val r0 = readResult(dut, 0)
-      assert(r0 == -128, s"Expected -128, got $r0")
+      assert(r0 == -400, s"Expected -400, got $r0")
     }
   }
 
@@ -597,9 +594,9 @@ class BitNetAcceleratorTest extends AnyFlatSpec with ChiselScalatestTester {
     }
   }
 
-  it should "H4: accumulator 128 clamps to 127" in {
+  it should "H4: raw accumulator 128 (no clamping)" in {
     test(new BitNetAccelerator) { dut =>
-      // all +1 × acts=[32,32,32,32] → 128 → clamp 127
+      // all +1 × acts=[32,32,32,32] → 128 (raw)
       val weightBase = 0x8300
       val weightMem = Map(0x8300 -> packWeights(Seq(1, 1, 1, 1)))
 
@@ -620,13 +617,13 @@ class BitNetAcceleratorTest extends AnyFlatSpec with ChiselScalatestTester {
       assert((status & 2) != 0, s"Expected DONE, got status=0x${status.toString(16)}")
 
       val r0 = readResult(dut, 0)
-      assert(r0 == 127, s"Expected 127, got $r0")
+      assert(r0 == 128, s"Expected 128, got $r0")
     }
   }
 
-  it should "H5: accumulator -192 clamps to -128" in {
+  it should "H5: raw accumulator -192 (no clamping)" in {
     test(new BitNetAccelerator) { dut =>
-      // all -1 × acts=[48,48,48,48] → -192 → clamp -128
+      // all -1 × acts=[48,48,48,48] → -192 (raw)
       val weightBase = 0x8400
       val weightMem = Map(0x8400 -> packWeights(Seq(-1, -1, -1, -1)))
 
@@ -647,7 +644,7 @@ class BitNetAcceleratorTest extends AnyFlatSpec with ChiselScalatestTester {
       assert((status & 2) != 0, s"Expected DONE, got status=0x${status.toString(16)}")
 
       val r0 = readResult(dut, 0)
-      assert(r0 == -128, s"Expected -128, got $r0")
+      assert(r0 == -192, s"Expected -192, got $r0")
     }
   }
 
@@ -789,8 +786,8 @@ class BitNetAcceleratorTest extends AnyFlatSpec with ChiselScalatestTester {
       assert(r1 == 4, s"Run 1: expected 4, got $r1")
 
       // Run 2: M=2, K=8, shift=1, act=2
-      // Row 0: +1*2*8 = 16 >> 1 = 8
-      // Row 1: -1*2*8 = -16 >> 1 = -8
+      // Row 0: +1*2*8 = 16 (raw accumulator)
+      // Row 1: -1*2*8 = -16 (raw accumulator)
       for (i <- 0 until 8) writeAct(dut, i, 2)
       writeReg(dut, 0x08, weightBase2)
       writeReg(dut, 0x0C, 2)  // M
@@ -805,8 +802,8 @@ class BitNetAcceleratorTest extends AnyFlatSpec with ChiselScalatestTester {
 
       val r2_0 = readResult(dut, 0)
       val r2_1 = readResult(dut, 1)
-      assert(r2_0 == 8, s"Run 2 Row 0: expected 8, got $r2_0")
-      assert(r2_1 == -8, s"Run 2 Row 1: expected -8, got $r2_1")
+      assert(r2_0 == 16, s"Run 2 Row 0: expected 16, got $r2_0")
+      assert(r2_1 == -16, s"Run 2 Row 1: expected -16, got $r2_1")
     }
   }
 
@@ -921,8 +918,8 @@ class BitNetAcceleratorTest extends AnyFlatSpec with ChiselScalatestTester {
   it should "C1: multi-row multi-tile with mixed patterns within a row" in {
     test(new BitNetAccelerator) { dut =>
       // M=2, K=8, shift=1
-      // Row 0: both tiles +1 → 1*8=8, >>1=4
-      // Row 1: tile0 +1, tile1 -1 → 4+(-4)=0, >>1=0
+      // Row 0: both tiles +1 → 1*8=8 (raw accumulator)
+      // Row 1: tile0 +1, tile1 -1 → 4+(-4)=0 (raw accumulator)
       val weightBase = 0xC300
       val weightMem = Map(
         0xC300 -> packWeights(Seq(1, 1, 1, 1)),    // row 0 tile 0
@@ -949,7 +946,7 @@ class BitNetAcceleratorTest extends AnyFlatSpec with ChiselScalatestTester {
 
       val r0 = readResult(dut, 0)
       val r1 = readResult(dut, 1)
-      assert(r0 == 4, s"Row 0: expected 4, got $r0")
+      assert(r0 == 8, s"Row 0: expected 8, got $r0")
       assert(r1 == 0, s"Row 1: expected 0, got $r1")
     }
   }
@@ -1048,7 +1045,7 @@ class BitNetAcceleratorTest extends AnyFlatSpec with ChiselScalatestTester {
     test(new BitNetAccelerator) { dut =>
       // M=2, K=8, shift=0, acts all=100
       // Row 0: tile0 +1, tile1 -1 → 400+(-400) = 0
-      // Row 1: all +1 → 800 → clamp 127
+      // Row 1: all +1 → 800 (raw accumulator)
       val weightBase = 0xD200
       val weightMem = Map(
         0xD200 -> packWeights(Seq(1, 1, 1, 1)),     // row 0 tile 0
@@ -1076,7 +1073,167 @@ class BitNetAcceleratorTest extends AnyFlatSpec with ChiselScalatestTester {
       val r0 = readResult(dut, 0)
       val r1 = readResult(dut, 1)
       assert(r0 == 0, s"Row 0: expected 0, got $r0")
-      assert(r1 == 127, s"Row 1: expected 127 (clamped from 800), got $r1")
+      assert(r1 == 800, s"Row 1: expected 800 (raw accumulator), got $r1")
+    }
+  }
+
+  // ---- M: K=2048 tests (maxDimK extension) ----
+
+  it should "M1: compute M=1 with K=2048 (512 tiles, max-K deep accumulation)" in {
+    val largeCfg = BitNetConfig(
+      numPEs = 4,
+      maxDimM = 16,
+      maxDimK = 2048,
+      avalonDataW = 8
+    )
+    test(new BitNetAccelerator()(largeCfg)) { dut =>
+      dut.clock.setTimeout(0)
+      val K = 2048
+      val shift = 5
+      val weightBase = 0xE000
+      val tilesPerRow = K / 4 // 512
+      // Every 4th weight = +1, rest 0. Per tile: [+1,0,0,0]·[4,4,4,4] = 4.
+      // 512 tiles × 4 = 2048 (raw accumulator).
+      val weightPacked = packWeights(Seq(1, 0, 0, 0))
+      val weightMem = (0 until tilesPerRow).map(t => (weightBase + t) -> weightPacked).toMap
+
+      dut.io.master.waitrequest.poke(false.B)
+      dut.io.master.readdatavalid.poke(false.B)
+      dut.io.master.readdata.poke(0.U)
+
+      for (i <- 0 until K) writeReg(dut, 0x80 + i * 4, 4)
+      writeReg(dut, 0x08, weightBase)
+      writeReg(dut, 0x0C, 1)     // M
+      writeReg(dut, 0x10, K)     // K
+      writeReg(dut, 0x14, shift) // shift
+      writeReg(dut, 0x00, 1)     // START
+
+      runWithMemory(dut, weightMem, 10000)
+
+      val status = readReg(dut, 0x04)
+      assert((status & 2) != 0, s"Expected DONE, got status=0x${status.toString(16)}")
+
+      val result = readResult(dut, 0)
+      assert(result == 2048, s"Expected 2048, got $result")
+    }
+  }
+
+  it should "M2: compute M=4 multi-row with K=2048" in {
+    val largeCfg = BitNetConfig(
+      numPEs = 4,
+      maxDimM = 16,
+      maxDimK = 2048,
+      avalonDataW = 8
+    )
+    test(new BitNetAccelerator()(largeCfg)) { dut =>
+      dut.clock.setTimeout(0)
+      val K = 2048
+      val shift = 5
+      val weightBase = 0xF000
+      val tilesPerRow = K / 4 // 512
+
+      // Row 0: all +1  → 2048*1=2048 (raw accumulator)
+      // Row 1: all -1  → -2048 (raw accumulator)
+      // Row 2: all  0  → 0
+      // Row 3: alt +1,-1,+1,-1 → 0 per tile → 0
+      val rowWeights = Seq(
+        packWeights(Seq(1, 1, 1, 1)),
+        packWeights(Seq(-1, -1, -1, -1)),
+        packWeights(Seq(0, 0, 0, 0)),
+        packWeights(Seq(1, -1, 1, -1))
+      )
+      val weightMem = (0 until 4).flatMap { row =>
+        (0 until tilesPerRow).map { t =>
+          (weightBase + row * tilesPerRow + t) -> rowWeights(row)
+        }
+      }.toMap
+
+      dut.io.master.waitrequest.poke(false.B)
+      dut.io.master.readdatavalid.poke(false.B)
+      dut.io.master.readdata.poke(0.U)
+
+      for (i <- 0 until K) writeReg(dut, 0x80 + i * 4, 1)
+      writeReg(dut, 0x08, weightBase)
+      writeReg(dut, 0x0C, 4)     // M
+      writeReg(dut, 0x10, K)     // K
+      writeReg(dut, 0x14, shift) // shift
+      writeReg(dut, 0x00, 1)     // START
+
+      runWithMemory(dut, weightMem, 40000)
+
+      val status = readReg(dut, 0x04)
+      assert((status & 2) != 0, s"Expected DONE, got status=0x${status.toString(16)}")
+
+      val expected = Seq(2048, -2048, 0, 0)
+      for (row <- 0 until 4) {
+        val result = readResult(dut, row)
+        assert(result == expected(row),
+          s"Row $row: expected ${expected(row)}, got $result")
+      }
+    }
+  }
+
+  it should "M3: back-to-back K=1024 then K=2048 dimension change" in {
+    val largeCfg = BitNetConfig(
+      numPEs = 4,
+      maxDimM = 16,
+      maxDimK = 2048,
+      avalonDataW = 8
+    )
+    test(new BitNetAccelerator()(largeCfg)) { dut =>
+      dut.clock.setTimeout(0)
+
+      dut.io.master.waitrequest.poke(false.B)
+      dut.io.master.readdatavalid.poke(false.B)
+      dut.io.master.readdata.poke(0.U)
+
+      // Run 1: K=1024, M=1, shift=4. All +1, act=4.
+      // 256 tiles × 4 = 1024 (raw accumulator).
+      val K1 = 1024
+      val tilesPerRow1 = K1 / 4
+      val weightBase1 = 0x10000
+      val weightPacked1 = packWeights(Seq(1, 0, 0, 0))
+      val weightMem1 = (0 until tilesPerRow1).map(t =>
+        (weightBase1 + t) -> weightPacked1
+      ).toMap
+
+      for (i <- 0 until K1) writeReg(dut, 0x80 + i * 4, 4)
+      writeReg(dut, 0x08, weightBase1)
+      writeReg(dut, 0x0C, 1)   // M
+      writeReg(dut, 0x10, K1)  // K
+      writeReg(dut, 0x14, 4)   // shift
+      writeReg(dut, 0x00, 1)   // START
+
+      runWithMemory(dut, weightMem1, 5000)
+
+      val status1 = readReg(dut, 0x04)
+      assert((status1 & 2) != 0, "Run 1: Expected DONE")
+      val r1 = readResult(dut, 0)
+      assert(r1 == 1024, s"Run 1: expected 1024, got $r1")
+
+      // Run 2: K=2048, M=1, shift=5. All +1, act=4.
+      // 512 tiles × 4 = 2048 (raw accumulator).
+      val K2 = 2048
+      val tilesPerRow2 = K2 / 4
+      val weightBase2 = 0x20000
+      val weightPacked2 = packWeights(Seq(1, 0, 0, 0))
+      val weightMem2 = (0 until tilesPerRow2).map(t =>
+        (weightBase2 + t) -> weightPacked2
+      ).toMap
+
+      for (i <- 0 until K2) writeReg(dut, 0x80 + i * 4, 4)
+      writeReg(dut, 0x08, weightBase2)
+      writeReg(dut, 0x0C, 1)   // M
+      writeReg(dut, 0x10, K2)  // K
+      writeReg(dut, 0x14, 5)   // shift
+      writeReg(dut, 0x00, 1)   // START
+
+      runWithMemory(dut, weightMem2, 10000)
+
+      val status2 = readReg(dut, 0x04)
+      assert((status2 & 2) != 0, "Run 2: Expected DONE")
+      val r2 = readResult(dut, 0)
+      assert(r2 == 2048, s"Run 2: expected 2048, got $r2")
     }
   }
 }

@@ -14,9 +14,9 @@ import chisel3.util._
   *   0x14  SHIFT_AMT    R/W  Requantization right-shift
   *   0x18  PERF_CYCLES  R    Performance counter
   *   0x80+  ACT_DATA    W    Activation buffer write (byte-addressed, stride 4, up to maxDimK entries)
-  *   0x2000+ RES_DATA   R    Result buffer read (byte-addressed, stride 4)
+  *   0x4000+ RES_DATA   R    Result buffer read (byte-addressed, stride 4)
   */
-class AvalonMMSlave(addrW: Int = 14, dataW: Int = 32) extends Bundle {
+class AvalonMMSlave(addrW: Int = 15, dataW: Int = 32) extends Bundle {
   val address   = Input(UInt(addrW.W))
   val read      = Input(Bool())
   val write     = Input(Bool())
@@ -43,9 +43,9 @@ class ControlRegs(implicit val cfg: BitNetConfig) extends Module {
     val actWriteAddr = Output(UInt(cfg.dimW.W))
     val actWriteData = Output(SInt(cfg.activationW.W))
 
-    // Result buffer read port
+    // Result buffer read port (raw accumulator, 32-bit)
     val resReadAddr = Output(UInt(cfg.dimW.W))
-    val resReadData = Input(SInt(8.W))
+    val resReadData = Input(SInt(32.W))
   })
 
   val regWeightBase = RegInit(0.U(cfg.avalonAddrW.W))
@@ -102,7 +102,7 @@ class ControlRegs(implicit val cfg: BitNetConfig) extends Module {
 
   // Read logic (readLatency = 1: register outputs, BRAM has natural 1-cycle latency)
   val regReadData = RegInit(0.U(32.W))
-  val readIsResult = RegNext(io.avalon.read && addr >= 0x2000.U, false.B)
+  val readIsResult = RegNext(io.avalon.read && addr >= 0x4000.U, false.B)
 
   when(io.avalon.read) {
     // Combinational register reads — registered for readLatency=1
@@ -116,8 +116,8 @@ class ControlRegs(implicit val cfg: BitNetConfig) extends Module {
     }
 
     // Result buffer read: present address to SyncReadMem (output arrives next cycle)
-    when(addr >= 0x2000.U) {
-      io.resReadAddr := (addr - 0x2000.U) >> 2
+    when(addr >= 0x4000.U) {
+      io.resReadAddr := (addr - 0x4000.U) >> 2
     }
   }
 

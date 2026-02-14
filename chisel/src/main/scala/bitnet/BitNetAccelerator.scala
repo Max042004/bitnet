@@ -28,8 +28,8 @@ class BitNetAccelerator(implicit val cfg: BitNetConfig) extends Module {
   val weightStr   = Module(new WeightStreamer)
   val computeCore = Module(new ComputeCore)
 
-  // Result buffer: stores INT8 results for readback
-  val resultMem = SyncReadMem(cfg.maxDimM, SInt(8.W))
+  // Result buffer: stores raw accumulator values (full precision) for readback
+  val resultMem = SyncReadMem(cfg.maxDimM, SInt(32.W))
   val resultWriteIdx = RegInit(0.U(cfg.dimW.W))
 
   // Performance counter
@@ -89,9 +89,11 @@ class BitNetAccelerator(implicit val cfg: BitNetConfig) extends Module {
   computeCore.io.rowStart := false.B
   computeCore.io.tileIn := false.B
 
-  // Write results from compute core
+  // Write raw accumulator to result buffer (skip INT8 requantization for precision)
+  val accumWide = Wire(SInt(32.W))
+  accumWide := computeCore.io.accumOut
   when(computeCore.io.resultValid) {
-    resultMem.write(resultWriteIdx, computeCore.io.resultData)
+    resultMem.write(resultWriteIdx, accumWide)
     resultWriteIdx := resultWriteIdx + 1.U
   }
 

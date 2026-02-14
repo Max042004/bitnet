@@ -17,7 +17,7 @@ case class BitNetConfig(
   avalonDataW:  Int = 256,
   avalonAddrW:  Int = 32,
   maxDimM:      Int = 1024,
-  maxDimK:      Int = 1024
+  maxDimK:      Int = 2048
 ) {
   require(isPow2(numPEs), "numPEs must be a power of 2")
   require(avalonDataW >= numPEs * 2, "Avalon data bus must fit all PE weight bits")

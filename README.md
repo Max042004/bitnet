@@ -103,11 +103,11 @@ All registers are accessed through the Avalon-MM slave interface. Byte-addressed
 | `0x04` | STATUS | R | Bit 0: BUSY, Bit 1: DONE |
 | `0x08` | WEIGHT_BASE | R/W | DDR3 byte address of weight matrix |
 | `0x0C` | DIM_M | R/W | Number of output rows (max 1024) |
-| `0x10` | DIM_K | R/W | Reduction dimension / input length (max 1024) |
+| `0x10` | DIM_K | R/W | Reduction dimension / input length (max 2048) |
 | `0x14` | SHIFT_AMT | R/W | Requantization right-shift amount (0–31) |
 | `0x18` | PERF_CYCLES | R | Clock cycles elapsed during last computation |
-| `0x80`–`0xFC` | ACT_DATA | W | Activation buffer — write INT8 values, stride-4 byte addressing: offset `0x80 + i*4` writes activation[i] |
-| `0x100`+ | RES_DATA | R | Result buffer — read INT8 outputs, stride-4 byte addressing: offset `0x100 + i*4` reads result[i] |
+| `0x80`–`0x207C` | ACT_DATA | W | Activation buffer — write INT8 values, stride-4 byte addressing: offset `0x80 + i*4` writes activation[i] (up to maxDimK=2048 entries) |
+| `0x4000`+ | RES_DATA | R | Result buffer — read INT8 outputs, stride-4 byte addressing: offset `0x4000 + i*4` reads result[i] |
 
 ## Platform Designer Integration (Quartus)
 
