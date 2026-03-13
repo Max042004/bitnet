@@ -13,11 +13,11 @@ package bitnet
 case class BitNetConfig(
   numPEs:       Int = 128,
   activationW:  Int = 8,
-  accumW:       Int = 20,
+  accumW:       Int = 21,
   avalonDataW:  Int = 256,
   avalonAddrW:  Int = 32,
   maxDimM:      Int = 1024,
-  maxDimK:      Int = 2048
+  maxDimK:      Int = 4096
 ) {
   require(isPow2(numPEs), "numPEs must be a power of 2")
   require(avalonDataW >= numPEs * 2, "Avalon data bus must fit all PE weight bits")

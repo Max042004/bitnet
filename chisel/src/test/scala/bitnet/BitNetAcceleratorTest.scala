@@ -96,7 +96,7 @@ class BitNetAcceleratorTest extends AnyFlatSpec with ChiselScalatestTester {
 
   /** Read raw 32-bit accumulator result from result buffer, sign-extending to Int */
   def readResult(dut: BitNetAccelerator, row: Int): Int = {
-    val raw = readReg(dut, 0x4000 + row * 4)
+    val raw = readReg(dut, 0x8000 + row * 4)
     if (raw > 0x7FFFFFFFL) (raw - 0x100000000L).toInt else raw.toInt
   }
 
