@@ -20,7 +20,7 @@ import chisel3.util._
 class ComputeCore(implicit val cfg: BitNetConfig) extends Module {
   val io = IO(new Bundle {
     // Weight input (from streamer)
-    val weightData  = Input(UInt(cfg.avalonDataW.W))
+    val weightData  = Input(UInt(cfg.weightDataW.W))
     val weightValid = Input(Bool())
 
     // Activation tile (from activation buffer)

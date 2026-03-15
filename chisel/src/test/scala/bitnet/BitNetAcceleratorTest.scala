@@ -55,14 +55,21 @@ class BitNetAcceleratorTest extends AnyFlatSpec with ChiselScalatestTester {
   /** Simulate accelerator with DDR3 burst memory model responding to Avalon master reads.
     * Captures address + burstcount when read is asserted, then delivers
     * back-to-back beats with 1-cycle initial latency.
+    * Also handles Avalon master writes (stores written data into ddr3Mem).
     */
-  def runWithMemory(dut: BitNetAccelerator, weightMem: Map[Int, BigInt], cycles: Int): Unit = {
+  def runWithMemory(dut: BitNetAccelerator, weightMem: Map[Int, BigInt], cycles: Int,
+                    ddr3Mem: scala.collection.mutable.Map[Int, BigInt] = null): Unit = {
     val bytesPerBeat = cfg.avalonDataW / 8
     var burstAddr = 0
     var burstRemaining = 0
     var newBurstPending = false
     var newBurstAddr = 0
     var newBurstLen = 0
+
+    // Merge weightMem into ddr3Mem if provided
+    if (ddr3Mem != null) {
+      weightMem.foreach { case (k, v) => ddr3Mem(k) = v }
+    }
 
     for (_ <- 0 until cycles) {
       // Start delivering a burst captured last cycle
@@ -75,7 +82,11 @@ class BitNetAcceleratorTest extends AnyFlatSpec with ChiselScalatestTester {
       // Deliver burst data
       if (burstRemaining > 0) {
         dut.io.master.readdatavalid.poke(true.B)
-        val data = weightMem.getOrElse(burstAddr, BigInt(0))
+        val data = if (ddr3Mem != null) {
+          ddr3Mem.getOrElse(burstAddr, BigInt(0))
+        } else {
+          weightMem.getOrElse(burstAddr, BigInt(0))
+        }
         dut.io.master.readdata.poke(data.U)
         burstAddr += bytesPerBeat
         burstRemaining -= 1
@@ -88,6 +99,13 @@ class BitNetAcceleratorTest extends AnyFlatSpec with ChiselScalatestTester {
         newBurstAddr = dut.io.master.address.peek().litValue.toInt
         newBurstLen = dut.io.master.burstcount.peek().litValue.toInt
         newBurstPending = true
+      }
+
+      // Handle write transactions
+      if (ddr3Mem != null && dut.io.master.write.peek().litToBoolean) {
+        val writeAddr = dut.io.master.address.peek().litValue.toInt
+        val writeData = dut.io.master.writedata.peek().litValue
+        ddr3Mem(writeAddr) = writeData
       }
 
       dut.clock.step(1)
@@ -1234,6 +1252,293 @@ class BitNetAcceleratorTest extends AnyFlatSpec with ChiselScalatestTester {
       assert((status2 & 2) != 0, "Run 2: Expected DONE")
       val r2 = readResult(dut, 0)
       assert(r2 == 2048, s"Run 2: expected 2048, got $r2")
+    }
+  }
+
+  // ---- N: DDR3 mode tests ----
+  // Use a 32-bit bus config for DDR3 tests so INT32 results fit in one beat
+  val ddr3Cfg: BitNetConfig = BitNetConfig(
+    numPEs = 4,
+    maxDimM = 16,
+    maxDimK = 16,
+    avalonDataW = 32   // 32-bit bus: 4 INT8 acts per beat, 1 INT32 result per beat
+  )
+
+  /** Pack INT8 activations into DDR3 memory entries for a given config. */
+  def packActsDdr3(acts: Seq[Int], c: BitNetConfig): Seq[(Int, BigInt)] = {
+    val actsPerBeat = (c.avalonDataW / c.activationW).max(1)
+    val bytesPerBeat = c.avalonDataW / 8
+    acts.grouped(actsPerBeat).zipWithIndex.map { case (group, idx) =>
+      var packed = BigInt(0)
+      for (i <- group.indices) {
+        packed = packed | (BigInt(group(i) & 0xFF) << (i * c.activationW))
+      }
+      (idx * bytesPerBeat, packed)
+    }.toSeq
+  }
+
+  /** Unpack INT32 results from DDR3 memory map written by ResultWriter. */
+  def unpackResults(ddr3Mem: scala.collection.mutable.Map[Int, BigInt],
+                    baseAddr: Int, count: Int, c: BitNetConfig): Seq[Int] = {
+    val resultsPerBeat = (c.avalonDataW / 32).max(1)
+    val bytesPerBeat = c.avalonDataW / 8
+    (0 until count).map { i =>
+      val beatIdx = i / resultsPerBeat
+      val slotIdx = i % resultsPerBeat
+      val addr = baseAddr + beatIdx * bytesPerBeat
+      val beatData = ddr3Mem.getOrElse(addr, BigInt(0))
+      val raw32 = (beatData >> (slotIdx * 32)) & BigInt(0xFFFFFFFFL)
+      if (raw32 > 0x7FFFFFFFL) (raw32 - BigInt(0x100000000L)).toInt else raw32.toInt
+    }
+  }
+
+  /** Pack weights for a given config (4 PEs, 2 bits each). */
+  def packWeightsDdr3(weights: Seq[Int]): BigInt = {
+    var packed = BigInt(0)
+    for (i <- weights.indices) {
+      val enc = weights(i) match {
+        case 0  => 0
+        case 1  => 1
+        case -1 => 2
+      }
+      packed = packed | (BigInt(enc) << (i * 2))
+    }
+    packed
+  }
+
+  /** Run DDR3 mode memory model for a given config. Handles reads and writes. */
+  def runDdr3Memory(dut: BitNetAccelerator, ddr3Mem: scala.collection.mutable.Map[Int, BigInt],
+                    cycles: Int, c: BitNetConfig): Unit = {
+    val bytesPerBeat = c.avalonDataW / 8
+    var burstAddr = 0
+    var burstRemaining = 0
+    var newBurstPending = false
+    var newBurstAddr = 0
+    var newBurstLen = 0
+
+    for (_ <- 0 until cycles) {
+      if (newBurstPending) {
+        burstAddr = newBurstAddr
+        burstRemaining = newBurstLen
+        newBurstPending = false
+      }
+
+      if (burstRemaining > 0) {
+        dut.io.master.readdatavalid.poke(true.B)
+        val data = ddr3Mem.getOrElse(burstAddr, BigInt(0))
+        dut.io.master.readdata.poke(data.U)
+        burstAddr += bytesPerBeat
+        burstRemaining -= 1
+      } else {
+        dut.io.master.readdatavalid.poke(false.B)
+      }
+
+      if (dut.io.master.read.peek().litToBoolean) {
+        newBurstAddr = dut.io.master.address.peek().litValue.toInt
+        newBurstLen = dut.io.master.burstcount.peek().litValue.toInt
+        newBurstPending = true
+      }
+
+      if (dut.io.master.write.peek().litToBoolean) {
+        val writeAddr = dut.io.master.address.peek().litValue.toInt
+        val writeData = dut.io.master.writedata.peek().litValue
+        ddr3Mem(writeAddr) = writeData
+      }
+
+      dut.clock.step(1)
+    }
+  }
+
+  it should "N1: DDR3 mode end-to-end M=2 K=4" in {
+    val c = ddr3Cfg
+    test(new BitNetAccelerator()(c)) { dut =>
+      val weightBase = 0x1000
+      val actBase = 0x2000
+      val resBase = 0x3000
+
+      val weightMem = Map(
+        0x1000 -> packWeightsDdr3(Seq(1, 1, 1, 1)),
+        0x1004 -> packWeightsDdr3(Seq(-1, -1, -1, -1))
+      )
+
+      val ddr3Mem = scala.collection.mutable.Map[Int, BigInt]()
+      weightMem.foreach { case (k, v) => ddr3Mem(k) = v }
+      for ((offset, data) <- packActsDdr3(Seq(1, 1, 1, 1), c)) {
+        ddr3Mem(actBase + offset) = data
+      }
+
+      dut.io.master.waitrequest.poke(false.B)
+      dut.io.master.readdatavalid.poke(false.B)
+      dut.io.master.readdata.poke(0.U)
+
+      writeReg(dut, 0x08, weightBase)
+      writeReg(dut, 0x28, actBase)
+      writeReg(dut, 0x2C, resBase)
+      writeReg(dut, 0x0C, 2)   // M
+      writeReg(dut, 0x10, 4)   // K
+      writeReg(dut, 0x14, 0)   // shift
+      writeReg(dut, 0x00, 3)   // START + DDR3_MODE
+
+      runDdr3Memory(dut, ddr3Mem, 300, c)
+
+      val status = readReg(dut, 0x04)
+      assert((status & 2) != 0, s"Expected DONE, got status=0x${status.toString(16)}")
+
+      val results = unpackResults(ddr3Mem, resBase, 2, c)
+      assert(results(0) == 4, s"Row 0: expected 4, got ${results(0)}")
+      assert(results(1) == -4, s"Row 1: expected -4, got ${results(1)}")
+    }
+  }
+
+  it should "N2: DDR3 mode M=4 with varying weight patterns" in {
+    val c = ddr3Cfg
+    test(new BitNetAccelerator()(c)) { dut =>
+      val weightBase = 0x4000
+      val actBase = 0x5000
+      val resBase = 0x6000
+
+      val weightMem = Map(
+        0x4000 -> packWeightsDdr3(Seq(1, 1, 1, 1)),
+        0x4004 -> packWeightsDdr3(Seq(0, 0, 0, 0)),
+        0x4008 -> packWeightsDdr3(Seq(-1, -1, -1, -1)),
+        0x400C -> packWeightsDdr3(Seq(1, -1, 1, -1))
+      )
+
+      val ddr3Mem = scala.collection.mutable.Map[Int, BigInt]()
+      weightMem.foreach { case (k, v) => ddr3Mem(k) = v }
+      for ((offset, data) <- packActsDdr3(Seq(1, 2, 3, 4), c)) {
+        ddr3Mem(actBase + offset) = data
+      }
+
+      dut.io.master.waitrequest.poke(false.B)
+      dut.io.master.readdatavalid.poke(false.B)
+      dut.io.master.readdata.poke(0.U)
+
+      writeReg(dut, 0x08, weightBase)
+      writeReg(dut, 0x28, actBase)
+      writeReg(dut, 0x2C, resBase)
+      writeReg(dut, 0x0C, 4)   // M
+      writeReg(dut, 0x10, 4)   // K
+      writeReg(dut, 0x14, 0)   // shift
+      writeReg(dut, 0x00, 3)   // START + DDR3_MODE
+
+      runDdr3Memory(dut, ddr3Mem, 500, c)
+
+      val status = readReg(dut, 0x04)
+      assert((status & 2) != 0, s"Expected DONE, got status=0x${status.toString(16)}")
+
+      val results = unpackResults(ddr3Mem, resBase, 4, c)
+      val expected = Seq(10, 0, -10, -2)
+      for (row <- 0 until 4) {
+        assert(results(row) == expected(row),
+          s"Row $row: expected ${expected(row)}, got ${results(row)}")
+      }
+    }
+  }
+
+  it should "N3: DDR3 mode with negative activations" in {
+    val c = ddr3Cfg
+    test(new BitNetAccelerator()(c)) { dut =>
+      val weightBase = 0x7000
+      val actBase = 0x7100
+      val resBase = 0x7200
+
+      val weightMem = Map(0x7000 -> packWeightsDdr3(Seq(1, 1, 1, 1)))
+
+      val ddr3Mem = scala.collection.mutable.Map[Int, BigInt]()
+      weightMem.foreach { case (k, v) => ddr3Mem(k) = v }
+      for ((offset, data) <- packActsDdr3(Seq(-2, -2, -2, -2), c)) {
+        ddr3Mem(actBase + offset) = data
+      }
+
+      dut.io.master.waitrequest.poke(false.B)
+      dut.io.master.readdatavalid.poke(false.B)
+      dut.io.master.readdata.poke(0.U)
+
+      writeReg(dut, 0x08, weightBase)
+      writeReg(dut, 0x28, actBase)
+      writeReg(dut, 0x2C, resBase)
+      writeReg(dut, 0x0C, 1)   // M
+      writeReg(dut, 0x10, 4)   // K
+      writeReg(dut, 0x14, 0)   // shift
+      writeReg(dut, 0x00, 3)   // START + DDR3_MODE
+
+      runDdr3Memory(dut, ddr3Mem, 300, c)
+
+      val status = readReg(dut, 0x04)
+      assert((status & 2) != 0, s"Expected DONE, got status=0x${status.toString(16)}")
+
+      val results = unpackResults(ddr3Mem, resBase, 1, c)
+      assert(results(0) == -8, s"Expected -8, got ${results(0)}")
+    }
+  }
+
+  it should "N4: DDR3 mode=0 still uses legacy register path" in {
+    test(new BitNetAccelerator) { dut =>
+      val weightBase = 0x9000
+      val weightMem = Map(0x9000 -> packWeights(Seq(1, 1, 1, 1)))
+
+      dut.io.master.waitrequest.poke(false.B)
+      dut.io.master.readdatavalid.poke(false.B)
+      dut.io.master.readdata.poke(0.U)
+
+      for (i <- 0 until 4) writeReg(dut, 0x80 + i * 4, 5)
+      writeReg(dut, 0x08, weightBase)
+      writeReg(dut, 0x0C, 1)  // M
+      writeReg(dut, 0x10, 4)  // K
+      writeReg(dut, 0x14, 0)  // shift
+      writeReg(dut, 0x00, 1)  // START (DDR3_MODE=0)
+
+      runWithMemory(dut, weightMem, 200)
+
+      val status = readReg(dut, 0x04)
+      assert((status & 2) != 0, s"Expected DONE, got status=0x${status.toString(16)}")
+
+      val r0 = readResult(dut, 0)
+      assert(r0 == 20, s"Expected 20, got $r0")
+    }
+  }
+
+  it should "N5: DDR3 mode with K=8 multi-tile" in {
+    val c = ddr3Cfg
+    test(new BitNetAccelerator()(c)) { dut =>
+      val weightBase = 0xA000
+      val actBase = 0xA100
+      val resBase = 0xA200
+
+      val weightMem = Map(
+        0xA000 -> packWeightsDdr3(Seq(1, 1, 1, 1)),     // row 0 tile 0
+        0xA004 -> packWeightsDdr3(Seq(1, 1, 1, 1)),     // row 0 tile 1
+        0xA008 -> packWeightsDdr3(Seq(-1, -1, -1, -1)),  // row 1 tile 0
+        0xA00C -> packWeightsDdr3(Seq(-1, -1, -1, -1))   // row 1 tile 1
+      )
+
+      val ddr3Mem = scala.collection.mutable.Map[Int, BigInt]()
+      weightMem.foreach { case (k, v) => ddr3Mem(k) = v }
+      for ((offset, data) <- packActsDdr3(Seq(1, 1, 1, 1, 1, 1, 1, 1), c)) {
+        ddr3Mem(actBase + offset) = data
+      }
+
+      dut.io.master.waitrequest.poke(false.B)
+      dut.io.master.readdatavalid.poke(false.B)
+      dut.io.master.readdata.poke(0.U)
+
+      writeReg(dut, 0x08, weightBase)
+      writeReg(dut, 0x28, actBase)
+      writeReg(dut, 0x2C, resBase)
+      writeReg(dut, 0x0C, 2)   // M
+      writeReg(dut, 0x10, 8)   // K
+      writeReg(dut, 0x14, 0)   // shift
+      writeReg(dut, 0x00, 3)   // START + DDR3_MODE
+
+      runDdr3Memory(dut, ddr3Mem, 400, c)
+
+      val status = readReg(dut, 0x04)
+      assert((status & 2) != 0, s"Expected DONE, got status=0x${status.toString(16)}")
+
+      val results = unpackResults(ddr3Mem, resBase, 2, c)
+      assert(results(0) == 8, s"Row 0: expected 8, got ${results(0)}")
+      assert(results(1) == -8, s"Row 1: expected -8, got ${results(1)}")
     }
   }
 }

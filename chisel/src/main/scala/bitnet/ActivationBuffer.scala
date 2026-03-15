@@ -6,22 +6,27 @@ import chisel3.util._
 /** Banked BRAM activation buffer with parallel read for the PE array.
   *
   * Uses numPEs independent BRAM banks (bank-interleaved layout) to enable
-  * parallel read of all numPEs activations in 2 cycles (1 issue + 1 latency),
-  * replacing the original sequential 65-cycle load.
+  * parallel read of all numPEs activations with 1-cycle SyncReadMem latency.
+  * The BRAM's internal output register provides the pipeline stage.
   *
   * Bank layout: activation[i] → bank[i % numPEs] at address i / numPEs
   */
 class ActivationBuffer(implicit val cfg: BitNetConfig) extends Module {
+  val actsPerBeat = (cfg.avalonDataW / cfg.activationW).max(1)  // 32 for 256-bit bus (min 1 for small test configs)
+
   val io = IO(new Bundle {
     // Write port (from HPS/ControlRegs)
     val writeEn   = Input(Bool())
     val writeAddr = Input(UInt(cfg.dimW.W))
     val writeData = Input(SInt(cfg.activationW.W))
 
-    // Tile load control
+    // Bulk write port (from ActivationLoader, 32 parallel writes per cycle)
+    val bulkWriteEn   = Input(Bool())
+    val bulkWriteData = Input(Vec(actsPerBeat, SInt(cfg.activationW.W)))
+    val bulkWriteBase = Input(UInt(cfg.dimW.W))
+
+    // Tile read address (present address cycle N, data valid cycle N+1)
     val tileOffset = Input(UInt(cfg.dimW.W))
-    val tileLoad   = Input(Bool())
-    val tileReady  = Output(Bool())
 
     // Parallel read port (to PE array)
     val activations = Output(Vec(cfg.numPEs, SInt(cfg.activationW.W)))
@@ -34,47 +39,42 @@ class ActivationBuffer(implicit val cfg: BitNetConfig) extends Module {
   // 64 independent BRAM banks (bank-interleaved: act[i] in bank[i % numPEs])
   val banks = Seq.fill(numBanks)(SyncReadMem(bankDepth, SInt(cfg.activationW.W)))
 
-  // Tile register file — holds numPEs activations for parallel read
-  val tileRegs = RegInit(VecInit(Seq.fill(cfg.numPEs)(0.S(cfg.activationW.W))))
+  // --- Write paths merged into single write port per bank ---
+  // HPS single-element write and bulk write are mutually exclusive (HPS writes
+  // before START, bulk writes during sLoadAct), so we MUX them into one write
+  // port. Combined with one read port, each bank has exactly 2 ports — matching
+  // Cyclone V M10K dual-port BRAM for efficient inference.
 
-  // FSM states
-  val sReady :: sLoading :: Nil = Enum(2)
-  val state = RegInit(sReady)
-
-  // --- Write path (HPS writes, bank-interleaved) ---
-  // Activation i → bank[i % numPEs] at address i / numPEs
   val writeBankSel  = io.writeAddr(bankSelW - 1, 0)
   val writeBankAddr = io.writeAddr >> bankSelW
 
-  for (b <- 0 until numBanks) {
-    when(io.writeEn && writeBankSel === b.U) {
-      banks(b).write(writeBankAddr, io.writeData)
-    }
-  }
-
-  // --- Read path (parallel tile load, 2 cycles) ---
-  // tileOffset = currentTile << log2(numPEs), so tileIndex = currentTile
+  // Read path (1-cycle pipelined via SyncReadMem)
   val tileIndex = io.tileOffset >> bankSelW
-  val readData  = VecInit(banks.map(_.read(tileIndex)))
 
-  io.tileReady := state === sReady
+  for (b <- 0 until numBanks) {
+    // Pre-decode which bulk-write index (0..actsPerBeat-1) targets this bank.
+    // bulkIdx = (b - bulkWriteBase) mod numBanks. Valid when < actsPerBeat.
+    val bulkIdx = (b.U(bankSelW.W) - io.bulkWriteBase(bankSelW - 1, 0))
+    val bulkIdxTrunc = bulkIdx(log2Ceil(actsPerBeat) - 1, 0)
+    val bulkValid = io.bulkWriteEn && bulkIdx < actsPerBeat.U
+    val bulkData = io.bulkWriteData(bulkIdxTrunc)
+    val bulkGlobalIdx = io.bulkWriteBase +& bulkIdx  // +& to avoid truncation
+    val bulkBankAddr = bulkGlobalIdx >> bankSelW
 
-  switch(state) {
-    is(sReady) {
-      when(io.tileLoad) {
-        state := sLoading
-        // All 64 banks sample tileIndex this cycle;
-        // SyncReadMem data will be valid next cycle
-      }
+    // Single-element HPS write targets this bank?
+    val hpsValid = io.writeEn && writeBankSel === b.U
+
+    // MUX into single write port (mutually exclusive; bulk has priority)
+    val bankAddrW = log2Ceil(bankDepth)
+    val wen   = hpsValid || bulkValid
+    val waddr = Mux(bulkValid, bulkBankAddr(bankAddrW - 1, 0), writeBankAddr(bankAddrW - 1, 0))
+    val wdata = Mux(bulkValid, bulkData, io.writeData)
+
+    when(wen) {
+      banks(b).write(waddr, wdata)
     }
-    is(sLoading) {
-      // Capture SyncReadMem output (1-cycle latency from read in sReady)
-      for (b <- 0 until numBanks) {
-        tileRegs(b) := readData(b)
-      }
-      state := sReady
-    }
+
+    // Read port (single .read() call per bank)
+    io.activations(b) := banks(b).read(tileIndex)
   }
-
-  io.activations := tileRegs
 }

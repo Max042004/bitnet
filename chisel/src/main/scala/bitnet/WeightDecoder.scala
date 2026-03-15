@@ -17,7 +17,7 @@ import chisel3._
   */
 class WeightDecoder(implicit val cfg: BitNetConfig) extends Module {
   val io = IO(new Bundle {
-    val packed = Input(UInt(cfg.avalonDataW.W))
+    val packed = Input(UInt(cfg.weightDataW.W))
     val enable = Output(Vec(cfg.numPEs, Bool()))
     val sign   = Output(Vec(cfg.numPEs, Bool()))
   })

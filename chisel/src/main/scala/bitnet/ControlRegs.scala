@@ -6,15 +6,17 @@ import chisel3.util._
 /** Avalon-MM slave register interface for HPS control.
   *
   * Register map:
-  *   0x00  CTRL         W    [0]=START (auto-clear)
-  *   0x04  STATUS       R    [0]=BUSY, [1]=DONE
-  *   0x08  WEIGHT_BASE  R/W  DDR3 base address for weights
-  *   0x0C  DIM_M        R/W  Output dimension
-  *   0x10  DIM_K        R/W  Input/reduction dimension
-  *   0x14  SHIFT_AMT    R/W  Requantization right-shift
-  *   0x18  PERF_CYCLES  R    Performance counter
-  *   0x80+  ACT_DATA    W    Activation buffer write (byte-addressed, stride 4, up to maxDimK entries)
-  *   0x4000+ RES_DATA   R    Result buffer read (byte-addressed, stride 4)
+  *   0x00  CTRL            W    [0]=START (auto-clear), [1]=DDR3_MODE
+  *   0x04  STATUS          R    [0]=BUSY, [1]=DONE
+  *   0x08  WEIGHT_BASE     R/W  DDR3 base address for weights
+  *   0x0C  DIM_M           R/W  Output dimension
+  *   0x10  DIM_K           R/W  Input/reduction dimension
+  *   0x14  SHIFT_AMT       R/W  Requantization right-shift
+  *   0x18  PERF_CYCLES     R    Performance counter
+  *   0x28  ACT_DDR3_BASE   R/W  DDR3 byte address for activations
+  *   0x2C  RES_DDR3_BASE   R/W  DDR3 byte address for results
+  *   0x80+  ACT_DATA       W    Activation buffer write (byte-addressed, stride 4, up to maxDimK entries)
+  *   0x4000+ RES_DATA      R    Result buffer read (byte-addressed, stride 4)
   */
 class AvalonMMSlave(addrW: Int = 16, dataW: Int = 32) extends Bundle {
   val address   = Input(UInt(addrW.W))
@@ -46,25 +48,36 @@ class ControlRegs(implicit val cfg: BitNetConfig) extends Module {
     // Result buffer read port (raw accumulator, 32-bit)
     val resReadAddr = Output(UInt(cfg.dimW.W))
     val resReadData = Input(SInt(32.W))
+
+    // DDR3 activation/result base addresses
+    val actDdr3Base = Output(UInt(cfg.avalonAddrW.W))
+    val resDdr3Base = Output(UInt(cfg.avalonAddrW.W))
+    val ddr3Mode    = Output(Bool())
   })
 
-  val regWeightBase = RegInit(0.U(cfg.avalonAddrW.W))
-  val regDimM       = RegInit(0.U(cfg.dimW.W))
-  val regDimK       = RegInit(0.U(cfg.dimW.W))
-  val regShiftAmt   = RegInit(0.U(5.W))
-  val regStart      = WireDefault(false.B)
-  val statusDone    = RegInit(false.B)
+  val regWeightBase  = RegInit(0.U(cfg.avalonAddrW.W))
+  val regDimM        = RegInit(0.U(cfg.dimW.W))
+  val regDimK        = RegInit(0.U(cfg.dimW.W))
+  val regShiftAmt    = RegInit(0.U(5.W))
+  val regStart       = WireDefault(false.B)
+  val statusDone     = RegInit(false.B)
+  val regActDdr3Base = RegInit(0.U(cfg.avalonAddrW.W))
+  val regResDdr3Base = RegInit(0.U(cfg.avalonAddrW.W))
+  val regDdr3Mode    = WireDefault(false.B)
 
   when(io.done) {
     statusDone := true.B
   }
 
   // Outputs
-  io.start     := regStart
-  io.weightBase := regWeightBase
-  io.dimM      := regDimM
-  io.dimK      := regDimK
-  io.shiftAmt  := regShiftAmt
+  io.start       := regStart
+  io.weightBase  := regWeightBase
+  io.dimM        := regDimM
+  io.dimK        := regDimK
+  io.shiftAmt    := regShiftAmt
+  io.actDdr3Base := regActDdr3Base
+  io.resDdr3Base := regResDdr3Base
+  io.ddr3Mode    := regDdr3Mode
 
   // Activation write defaults
   io.actWriteEn   := false.B
@@ -81,15 +94,18 @@ class ControlRegs(implicit val cfg: BitNetConfig) extends Module {
     switch(addr) {
       is(0x00.U) {
         regStart := io.avalon.writedata(0)
-        // Clear done on start
+        // Clear done on start, latch DDR3_MODE from bit[1]
         when(io.avalon.writedata(0)) {
           statusDone := false.B
+          regDdr3Mode := io.avalon.writedata(1)
         }
       }
       is(0x08.U) { regWeightBase := io.avalon.writedata }
       is(0x0C.U) { regDimM := io.avalon.writedata }
       is(0x10.U) { regDimK := io.avalon.writedata }
       is(0x14.U) { regShiftAmt := io.avalon.writedata(4, 0) }
+      is(0x28.U) { regActDdr3Base := io.avalon.writedata }
+      is(0x2C.U) { regResDdr3Base := io.avalon.writedata }
     }
 
     // Activation data write: addresses 0x80 to 0x80 + (maxDimK-1)*4
@@ -113,6 +129,8 @@ class ControlRegs(implicit val cfg: BitNetConfig) extends Module {
       is(0x10.U) { regReadData := regDimK }
       is(0x14.U) { regReadData := regShiftAmt }
       is(0x18.U) { regReadData := io.perfCycles }
+      is(0x28.U) { regReadData := regActDdr3Base }
+      is(0x2C.U) { regReadData := regResDdr3Base }
     }
 
     // Result buffer read: present address to SyncReadMem (output arrives next cycle)
