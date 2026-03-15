@@ -60,11 +60,14 @@ class BitNetAcceleratorTest extends AnyFlatSpec with ChiselScalatestTester {
   def runWithMemory(dut: BitNetAccelerator, weightMem: Map[Int, BigInt], cycles: Int,
                     ddr3Mem: scala.collection.mutable.Map[Int, BigInt] = null): Unit = {
     val bytesPerBeat = cfg.avalonDataW / 8
+    // Burst queue: supports pipelined sub-bursts (multiple in flight)
+    val burstQueue = scala.collection.mutable.Queue[(Int, Int)]()  // (addr, len)
     var burstAddr = 0
     var burstRemaining = 0
-    var newBurstPending = false
-    var newBurstAddr = 0
-    var newBurstLen = 0
+
+    // Burst write tracking
+    var writeBurstAddr = 0
+    var writeBurstRemaining = 0
 
     // Merge weightMem into ddr3Mem if provided
     if (ddr3Mem != null) {
@@ -72,11 +75,11 @@ class BitNetAcceleratorTest extends AnyFlatSpec with ChiselScalatestTester {
     }
 
     for (_ <- 0 until cycles) {
-      // Start delivering a burst captured last cycle
-      if (newBurstPending) {
-        burstAddr = newBurstAddr
-        burstRemaining = newBurstLen
-        newBurstPending = false
+      // If current burst is done and queue has more, start next
+      if (burstRemaining == 0 && burstQueue.nonEmpty) {
+        val (a, l) = burstQueue.dequeue()
+        burstAddr = a
+        burstRemaining = l
       }
 
       // Deliver burst data
@@ -94,18 +97,28 @@ class BitNetAcceleratorTest extends AnyFlatSpec with ChiselScalatestTester {
         dut.io.master.readdatavalid.poke(false.B)
       }
 
-      // Capture new burst read request
+      // Capture new burst read request (queue it for pipelined delivery)
       if (dut.io.master.read.peek().litToBoolean) {
-        newBurstAddr = dut.io.master.address.peek().litValue.toInt
-        newBurstLen = dut.io.master.burstcount.peek().litValue.toInt
-        newBurstPending = true
+        val addr = dut.io.master.address.peek().litValue.toInt
+        val len = dut.io.master.burstcount.peek().litValue.toInt
+        burstQueue.enqueue((addr, len))
       }
 
-      // Handle write transactions
-      if (ddr3Mem != null && dut.io.master.write.peek().litToBoolean) {
-        val writeAddr = dut.io.master.address.peek().litValue.toInt
-        val writeData = dut.io.master.writedata.peek().litValue
-        ddr3Mem(writeAddr) = writeData
+      // Handle write transactions (with burst auto-increment)
+      if (dut.io.master.write.peek().litToBoolean &&
+          !dut.io.master.waitrequest.peek().litToBoolean) {
+        if (ddr3Mem != null) {
+          if (writeBurstRemaining == 0) {
+            writeBurstAddr = dut.io.master.address.peek().litValue.toInt
+            writeBurstRemaining = dut.io.master.burstcount.peek().litValue.toInt
+          }
+          val writeData = dut.io.master.writedata.peek().litValue
+          ddr3Mem(writeBurstAddr) = writeData
+          writeBurstAddr += bytesPerBeat
+          writeBurstRemaining -= 1
+        } else {
+          // Legacy: ignore writes when no ddr3Mem
+        }
       }
 
       dut.clock.step(1)
@@ -1310,17 +1323,19 @@ class BitNetAcceleratorTest extends AnyFlatSpec with ChiselScalatestTester {
   def runDdr3Memory(dut: BitNetAccelerator, ddr3Mem: scala.collection.mutable.Map[Int, BigInt],
                     cycles: Int, c: BitNetConfig): Unit = {
     val bytesPerBeat = c.avalonDataW / 8
+    val burstQueue = scala.collection.mutable.Queue[(Int, Int)]()
     var burstAddr = 0
     var burstRemaining = 0
-    var newBurstPending = false
-    var newBurstAddr = 0
-    var newBurstLen = 0
+
+    // Burst write tracking (auto-increment address within burst)
+    var writeBurstAddr = 0
+    var writeBurstRemaining = 0
 
     for (_ <- 0 until cycles) {
-      if (newBurstPending) {
-        burstAddr = newBurstAddr
-        burstRemaining = newBurstLen
-        newBurstPending = false
+      if (burstRemaining == 0 && burstQueue.nonEmpty) {
+        val (a, l) = burstQueue.dequeue()
+        burstAddr = a
+        burstRemaining = l
       }
 
       if (burstRemaining > 0) {
@@ -1334,15 +1349,22 @@ class BitNetAcceleratorTest extends AnyFlatSpec with ChiselScalatestTester {
       }
 
       if (dut.io.master.read.peek().litToBoolean) {
-        newBurstAddr = dut.io.master.address.peek().litValue.toInt
-        newBurstLen = dut.io.master.burstcount.peek().litValue.toInt
-        newBurstPending = true
+        burstQueue.enqueue((
+          dut.io.master.address.peek().litValue.toInt,
+          dut.io.master.burstcount.peek().litValue.toInt
+        ))
       }
 
-      if (dut.io.master.write.peek().litToBoolean) {
-        val writeAddr = dut.io.master.address.peek().litValue.toInt
+      if (dut.io.master.write.peek().litToBoolean &&
+          !dut.io.master.waitrequest.peek().litToBoolean) {
+        if (writeBurstRemaining == 0) {
+          writeBurstAddr = dut.io.master.address.peek().litValue.toInt
+          writeBurstRemaining = dut.io.master.burstcount.peek().litValue.toInt
+        }
         val writeData = dut.io.master.writedata.peek().litValue
-        ddr3Mem(writeAddr) = writeData
+        ddr3Mem(writeBurstAddr) = writeData
+        writeBurstAddr += bytesPerBeat
+        writeBurstRemaining -= 1
       }
 
       dut.clock.step(1)

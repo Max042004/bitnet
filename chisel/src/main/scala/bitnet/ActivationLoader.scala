@@ -5,17 +5,16 @@ import chisel3.util._
 
 /** Burst-reads INT8 activations from DDR3 into ActivationBuffer's banked BRAM.
   *
-  * Packing: 256 bits / 8 bits = 32 INT8 activations per beat.
-  * K=4096 → 128 beats across multiple bursts (max burst = 32 beats).
+  * Pipelined sub-bursts: issues multiple bursts of maxBurstLen beats
+  * back-to-back, starting the next burst as soon as the previous one's
+  * read command is accepted. This keeps the DDR3 read pipeline full.
   *
-  * FSM: sIdle → sRead → sFill → (loop if more) → sDone
-  *
-  * burstCountW=6 limits a single burst to 63 beats. We use maxBurstBeats=32
-  * (matching WeightStreamer) and issue multiple bursts to cover all K activations.
+  * Packing: avalonDataW bits / 8 bits = actsPerBeat INT8 activations per beat.
+  * K=4096, 128-bit bus → 16 acts/beat → 256 beats total → 16 sub-bursts of 16.
   */
 class ActivationLoader(implicit val cfg: BitNetConfig) extends Module {
-  val actsPerBeat = (cfg.avalonDataW / cfg.activationW).max(1)  // 256/8 = 32 (min 1 for small test configs)
-  val maxBurstBeats = 1 << (cfg.burstCountW - 1)  // 32 for burstCountW=6
+  val actsPerBeat = (cfg.avalonDataW / cfg.activationW).max(1)
+  val maxBurst = cfg.maxBurstLen
 
   val io = IO(new Bundle {
     val start    = Input(Bool())
@@ -37,21 +36,23 @@ class ActivationLoader(implicit val cfg: BitNetConfig) extends Module {
     val bulkWriteBase = Output(UInt(cfg.dimW.W))
   })
 
-  val sIdle :: sRead :: sFill :: sDone :: Nil = Enum(4)
+  val sIdle :: sBurst :: sDone :: Nil = Enum(3)
   val state = RegInit(sIdle)
 
   val bytesPerBeat = cfg.avalonDataW / 8
   val addr = RegInit(0.U(cfg.avalonAddrW.W))
-  val totalBeats = RegInit(0.U(cfg.dimW.W))       // total beats remaining across all bursts
-  val currentBurst = RegInit(0.U(cfg.burstCountW.W))  // beats in current burst
-  val burstBeatsLeft = RegInit(0.U(cfg.burstCountW.W)) // beats left in current burst
-  val beatsReceived = RegInit(0.U(cfg.dimW.W))     // global beat counter (for bulkWriteBase)
+  val totalBeats = RegInit(0.U(cfg.dimW.W))
+  val beatsIssued = RegInit(0.U(cfg.dimW.W))
+  val beatsReceived = RegInit(0.U(cfg.dimW.W))
+
+  val remainingBeats = totalBeats - beatsIssued
+  val thisBurstLen = Mux(remainingBeats > maxBurst.U, maxBurst.U, remainingBeats)
 
   // Defaults
   io.done := false.B
   io.avalon_address := addr
   io.avalon_read := false.B
-  io.avalon_burstcount := currentBurst
+  io.avalon_burstcount := thisBurstLen(cfg.burstCountW - 1, 0)
   io.bulkWriteEn := false.B
   io.bulkWriteBase := 0.U
   for (i <- 0 until actsPerBeat) {
@@ -61,48 +62,39 @@ class ActivationLoader(implicit val cfg: BitNetConfig) extends Module {
   switch(state) {
     is(sIdle) {
       when(io.start) {
-        // ceil(K / actsPerBeat)
         val total = (io.dimK + (actsPerBeat - 1).U) >> log2Ceil(actsPerBeat).U
         totalBeats := total
         addr := io.ddr3Addr
+        beatsIssued := 0.U
         beatsReceived := 0.U
-        state := sRead
+        state := sBurst
       }
     }
-    is(sRead) {
-      // Issue burst of min(totalBeats, maxBurstBeats)
-      val burst = Mux(totalBeats > maxBurstBeats.U, maxBurstBeats.U, totalBeats)(cfg.burstCountW - 1, 0)
-      currentBurst := burst
-      burstBeatsLeft := burst
-      io.avalon_read := true.B
-      io.avalon_address := addr
-      io.avalon_burstcount := burst
-      when(!io.avalon_waitrequest) {
-        state := sFill
+    is(sBurst) {
+      // Issue sub-bursts back-to-back
+      when(beatsIssued < totalBeats) {
+        io.avalon_read := true.B
+        io.avalon_address := addr
+        io.avalon_burstcount := thisBurstLen(cfg.burstCountW - 1, 0)
+        when(!io.avalon_waitrequest) {
+          beatsIssued := beatsIssued + thisBurstLen
+          addr := addr + thisBurstLen * bytesPerBeat.U
+        }
       }
-    }
-    is(sFill) {
+
+      // Receive data concurrently
       when(io.avalon_readdatavalid) {
-        // Unpack activations from readdata
         io.bulkWriteEn := true.B
         io.bulkWriteBase := beatsReceived << log2Ceil(actsPerBeat).U
         for (i <- 0 until actsPerBeat) {
           io.bulkWriteData(i) := io.avalon_readdata(i * cfg.activationW + cfg.activationW - 1, i * cfg.activationW).asSInt
         }
         beatsReceived := beatsReceived + 1.U
-        val nextLeft = burstBeatsLeft - 1.U
-        burstBeatsLeft := nextLeft
-        when(nextLeft === 0.U) {
-          // Current burst done — advance address and totalBeats
-          val used = currentBurst
-          totalBeats := totalBeats - used
-          addr := addr + (used * bytesPerBeat.U)
-          when(totalBeats - used === 0.U) {
-            state := sDone
-          }.otherwise {
-            state := sRead  // issue next burst
-          }
-        }
+      }
+
+      // Done when all data received
+      when(beatsReceived + io.avalon_readdatavalid.asUInt === totalBeats) {
+        state := sDone
       }
     }
     is(sDone) {

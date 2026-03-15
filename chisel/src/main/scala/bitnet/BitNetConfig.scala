@@ -17,7 +17,8 @@ case class BitNetConfig(
   avalonDataW:  Int = 128,
   avalonAddrW:  Int = 32,
   maxDimM:      Int = 1024,
-  maxDimK:      Int = 4096
+  maxDimK:      Int = 4096,
+  maxBurstLen:  Int = 16   // Max Avalon burst length per sub-burst (pipelined)
 ) {
   require(isPow2(numPEs), "numPEs must be a power of 2")
   require(maxDimK % numPEs == 0, "maxDimK must be divisible by numPEs for banked activation buffer")

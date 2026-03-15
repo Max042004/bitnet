@@ -177,7 +177,7 @@ class BitNetAccelerator(implicit val cfg: BitNetConfig) extends Module {
     io.master.write := resWriter.io.avalon_write
     io.master.writedata := resWriter.io.avalon_writedata
     io.master.byteenable := resWriter.io.avalon_byteenable
-    io.master.burstcount := 1.U  // single-beat writes
+    io.master.burstcount := resWriter.io.avalon_burstcount
     resWriter.io.avalon_waitrequest := io.master.waitrequest
   }.otherwise {
     // WeightStreamer drives master reads (during compute states)
