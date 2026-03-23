@@ -14,7 +14,7 @@ case class BitNetConfig(
   numPEs:       Int = 128,
   activationW:  Int = 8,
   accumW:       Int = 21,
-  avalonDataW:  Int = 128,
+  avalonDataW:  Int = 256,
   avalonAddrW:  Int = 32,
   maxDimM:      Int = 1024,
   maxDimK:      Int = 4096,
