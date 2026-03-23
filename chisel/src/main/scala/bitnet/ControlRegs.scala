@@ -13,6 +13,7 @@ import chisel3.util._
   *   0x10  DIM_K           R/W  Input/reduction dimension
   *   0x14  SHIFT_AMT       R/W  Requantization right-shift
   *   0x18  PERF_CYCLES     R    Performance counter
+  *   0x20  TILE_STRIDE     R/W  Byte spacing between tile blocks in DDR3 (= totalM * 32)
   *   0x28  ACT_DDR3_BASE   R/W  DDR3 byte address for activations
   *   0x2C  RES_DDR3_BASE   R/W  DDR3 byte address for results
   *   0x80+  ACT_DATA       W    Activation buffer write (byte-addressed, stride 4, up to maxDimK entries)
@@ -53,6 +54,9 @@ class ControlRegs(implicit val cfg: BitNetConfig) extends Module {
     val actDdr3Base = Output(UInt(cfg.avalonAddrW.W))
     val resDdr3Base = Output(UInt(cfg.avalonAddrW.W))
     val ddr3Mode    = Output(Bool())
+
+    // Tile stride: byte spacing between consecutive tile blocks in DDR3
+    val tileStride  = Output(UInt(cfg.avalonAddrW.W))
   })
 
   val regWeightBase  = RegInit(0.U(cfg.avalonAddrW.W))
@@ -64,6 +68,7 @@ class ControlRegs(implicit val cfg: BitNetConfig) extends Module {
   val regActDdr3Base = RegInit(0.U(cfg.avalonAddrW.W))
   val regResDdr3Base = RegInit(0.U(cfg.avalonAddrW.W))
   val regDdr3Mode    = WireDefault(false.B)
+  val regTileStride  = RegInit(0.U(cfg.avalonAddrW.W))
 
   when(io.done) {
     statusDone := true.B
@@ -78,6 +83,7 @@ class ControlRegs(implicit val cfg: BitNetConfig) extends Module {
   io.actDdr3Base := regActDdr3Base
   io.resDdr3Base := regResDdr3Base
   io.ddr3Mode    := regDdr3Mode
+  io.tileStride  := regTileStride
 
   // Activation write defaults
   io.actWriteEn   := false.B
@@ -104,6 +110,7 @@ class ControlRegs(implicit val cfg: BitNetConfig) extends Module {
       is(0x0C.U) { regDimM := io.avalon.writedata }
       is(0x10.U) { regDimK := io.avalon.writedata }
       is(0x14.U) { regShiftAmt := io.avalon.writedata(4, 0) }
+      is(0x20.U) { regTileStride := io.avalon.writedata }
       is(0x28.U) { regActDdr3Base := io.avalon.writedata }
       is(0x2C.U) { regResDdr3Base := io.avalon.writedata }
     }
@@ -129,6 +136,7 @@ class ControlRegs(implicit val cfg: BitNetConfig) extends Module {
       is(0x10.U) { regReadData := regDimK }
       is(0x14.U) { regReadData := regShiftAmt }
       is(0x18.U) { regReadData := io.perfCycles }
+      is(0x20.U) { regReadData := regTileStride }
       is(0x28.U) { regReadData := regActDdr3Base }
       is(0x2C.U) { regReadData := regResDdr3Base }
     }

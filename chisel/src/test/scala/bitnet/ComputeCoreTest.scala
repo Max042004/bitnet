@@ -5,125 +5,160 @@ import chiseltest._
 import org.scalatest.flatspec.AnyFlatSpec
 
 class ComputeCoreTest extends AnyFlatSpec with ChiselScalatestTester {
-  implicit val cfg: BitNetConfig = BitNetConfig(numPEs = 64, avalonDataW = 128)
+  implicit val cfg: BitNetConfig = BitNetConfig(numPEs = 8, avalonDataW = 16, maxDimK = 8, maxDimM = 4)
 
-  behavior of "ComputeCore"
+  behavior of "ComputeCore (T-MAC)"
 
-  it should "compute a single tile dot product" in {
+  /** Pack weights: 0→00, +1→01, -1→10 */
+  def packWeights(weights: Seq[Int]): BigInt = {
+    var packed = BigInt(0)
+    for (i <- weights.indices) {
+      val enc = weights(i) match { case 0 => 0; case 1 => 1; case -1 => 2 }
+      packed = packed | (BigInt(enc) << (i * 2))
+    }
+    packed
+  }
+
+  it should "build LUTs and compute single-tile dot product for one row" in {
     test(new ComputeCore) { dut =>
-      // Set up: all activations = 1, all weights = +1 (encoding 01)
-      // Expected sum = 64
+      // numPEs=8, numGroups=2, groupSize=4
+      // Activations: [1, 1, 1, 1, 1, 1, 1, 1]
+      // Weights: all +1
+      // Expected dot product: 8
       for (i <- 0 until cfg.numPEs) {
         dut.io.activations(i).poke(1.S)
       }
-      dut.io.dimK.poke(cfg.numPEs.U)
-      dut.io.shiftAmt.poke(0.U)
 
-      // All-+1 weight word: each PE gets encoding 01 → bits = 01_01_01...
-      var packed = BigInt(0)
-      for (i <- 0 until cfg.numPEs) {
-        packed = packed | (BigInt(1) << (i * 2))
+      // Clear accumulator for row 0
+      dut.io.accumClearEn.poke(true.B)
+      dut.io.accumClearAddr.poke(0.U)
+      dut.clock.step(1)
+      dut.io.accumClearEn.poke(false.B)
+
+      // Build LUTs
+      dut.io.lutBuildStart.poke(true.B)
+      dut.clock.step(1)
+      dut.io.lutBuildStart.poke(false.B)
+
+      // Wait for LUT build to complete
+      while (!dut.io.lutBuildDone.peek().litToBoolean) {
+        dut.clock.step(1)
       }
 
-      // Start new row
-      dut.io.rowStart.poke(true.B)
-      dut.io.tileIn.poke(true.B)
+      // Feed weight for row 0
+      val packed = packWeights(Seq.fill(cfg.numPEs)(1))
       dut.io.weightData.poke(packed.U)
       dut.io.weightValid.poke(true.B)
+      dut.io.rowIdx.poke(0.U)
       dut.clock.step(1)
-      dut.io.rowStart.poke(false.B)
-      dut.io.tileIn.poke(false.B)
       dut.io.weightValid.poke(false.B)
 
-      // Wait for pipeline to flush
-      dut.clock.step(cfg.treePipeStages + 4)
+      // Wait for pipeline: 1 (indexer reg) + tmacTreePipeStages (tree) + 2 (accum RMW)
+      dut.clock.step(cfg.tmacTreePipeStages + 4)
 
-      // Check accumulator output
-      val accumVal = dut.io.accumOut.peek().litValue.toInt
-      println(s"Accumulator value: $accumVal (expected: ${cfg.numPEs})")
-      assert(accumVal == cfg.numPEs, s"Expected ${cfg.numPEs}, got $accumVal")
+      // Read accumulator for row 0
+      dut.io.accumReadAddr.poke(0.U)
+      dut.clock.step(1) // SyncReadMem 1-cycle latency
+      val accumVal = dut.io.accumReadData.peek().litValue.toInt
+      println(s"Accumulator[0] = $accumVal (expected: 8)")
+      assert(accumVal == 8, s"Expected 8, got $accumVal")
     }
   }
 
   it should "compute dot product with mixed weights" in {
     test(new ComputeCore) { dut =>
-      // Activations: all = 10
-      // Weights: first half +1, second half -1
-      // Expected: 32*10 - 32*10 = 0
+      // Activations: [10, 10, 10, 10, 10, 10, 10, 10]
+      // Weights: first 4 = +1, last 4 = -1
+      // Expected: 4*10 - 4*10 = 0
       for (i <- 0 until cfg.numPEs) {
         dut.io.activations(i).poke(10.S)
       }
-      dut.io.dimK.poke(cfg.numPEs.U)
-      dut.io.shiftAmt.poke(0.U)
 
-      var packed = BigInt(0)
-      for (i <- 0 until cfg.numPEs) {
-        if (i < cfg.numPEs / 2) {
-          packed = packed | (BigInt(1) << (i * 2))   // 01 = +1
-        } else {
-          packed = packed | (BigInt(2) << (i * 2))   // 10 = -1
-        }
+      dut.io.accumClearEn.poke(true.B)
+      dut.io.accumClearAddr.poke(0.U)
+      dut.clock.step(1)
+      dut.io.accumClearEn.poke(false.B)
+
+      dut.io.lutBuildStart.poke(true.B)
+      dut.clock.step(1)
+      dut.io.lutBuildStart.poke(false.B)
+
+      while (!dut.io.lutBuildDone.peek().litToBoolean) {
+        dut.clock.step(1)
       }
 
-      dut.io.rowStart.poke(true.B)
-      dut.io.tileIn.poke(true.B)
-      dut.io.weightData.poke(packed.U)
+      val weights = Seq(1, 1, 1, 1, -1, -1, -1, -1)
+      dut.io.weightData.poke(packWeights(weights).U)
       dut.io.weightValid.poke(true.B)
+      dut.io.rowIdx.poke(0.U)
       dut.clock.step(1)
-      dut.io.rowStart.poke(false.B)
-      dut.io.tileIn.poke(false.B)
       dut.io.weightValid.poke(false.B)
 
-      dut.clock.step(cfg.treePipeStages + 4)
+      dut.clock.step(cfg.tmacTreePipeStages + 4)
 
-      val accumVal = dut.io.accumOut.peek().litValue.toInt
-      println(s"Accumulator value: $accumVal (expected: 0)")
+      dut.io.accumReadAddr.poke(0.U)
+      dut.clock.step(1)
+      val accumVal = dut.io.accumReadData.peek().litValue.toInt
+      println(s"Accumulator[0] = $accumVal (expected: 0)")
       assert(accumVal == 0)
     }
   }
 
-  it should "accumulate across multiple tiles" in {
+  it should "accumulate across multiple rows sharing same LUT" in {
     test(new ComputeCore) { dut =>
-      // 2 tiles, each with activations=1, weights=+1
-      // Expected: 64 + 64 = 128
+      // Activations: [1, 2, 3, 4, 5, 6, 7, 8]
+      // Row 0 weights: all +1 → expected 1+2+3+4+5+6+7+8 = 36
+      // Row 1 weights: all -1 → expected -(1+2+3+4+5+6+7+8) = -36
+      val acts = Seq(1, 2, 3, 4, 5, 6, 7, 8)
       for (i <- 0 until cfg.numPEs) {
-        dut.io.activations(i).poke(1.S)
-      }
-      dut.io.dimK.poke((cfg.numPEs * 2).U)
-      dut.io.shiftAmt.poke(0.U)
-
-      var packed = BigInt(0)
-      for (i <- 0 until cfg.numPEs) {
-        packed = packed | (BigInt(1) << (i * 2))
+        dut.io.activations(i).poke(acts(i).S)
       }
 
-      // Tile 0
-      dut.io.rowStart.poke(true.B)
-      dut.io.tileIn.poke(true.B)
-      dut.io.weightData.poke(packed.U)
-      dut.io.weightValid.poke(true.B)
+      // Clear rows 0 and 1
+      for (r <- 0 until 2) {
+        dut.io.accumClearEn.poke(true.B)
+        dut.io.accumClearAddr.poke(r.U)
+        dut.clock.step(1)
+      }
+      dut.io.accumClearEn.poke(false.B)
+
+      // Build LUTs
+      dut.io.lutBuildStart.poke(true.B)
       dut.clock.step(1)
-      dut.io.rowStart.poke(false.B)
-      dut.io.tileIn.poke(false.B)
+      dut.io.lutBuildStart.poke(false.B)
+      while (!dut.io.lutBuildDone.peek().litToBoolean) {
+        dut.clock.step(1)
+      }
+
+      // Feed row 0 weight
+      dut.io.weightData.poke(packWeights(Seq.fill(cfg.numPEs)(1)).U)
+      dut.io.weightValid.poke(true.B)
+      dut.io.rowIdx.poke(0.U)
+      dut.clock.step(1)
+
+      // Feed row 1 weight (back-to-back)
+      dut.io.weightData.poke(packWeights(Seq.fill(cfg.numPEs)(-1)).U)
+      dut.io.rowIdx.poke(1.U)
+      dut.clock.step(1)
       dut.io.weightValid.poke(false.B)
 
       // Wait for pipeline
-      dut.clock.step(cfg.treePipeStages + 2)
+      dut.clock.step(cfg.tmacTreePipeStages + 4)
 
-      // Tile 1
-      dut.io.tileIn.poke(true.B)
-      dut.io.weightData.poke(packed.U)
-      dut.io.weightValid.poke(true.B)
+      // Read row 0
+      dut.io.accumReadAddr.poke(0.U)
       dut.clock.step(1)
-      dut.io.tileIn.poke(false.B)
-      dut.io.weightValid.poke(false.B)
+      val v0 = dut.io.accumReadData.peek().litValue.toInt
+      println(s"Accumulator[0] = $v0 (expected: 36)")
+      assert(v0 == 36, s"Row 0: expected 36, got $v0")
 
-      // Wait for second tile
-      dut.clock.step(cfg.treePipeStages + 4)
-
-      val accumVal = dut.io.accumOut.peek().litValue.toInt
-      println(s"Accumulator value: $accumVal (expected: ${cfg.numPEs * 2})")
-      assert(accumVal == cfg.numPEs * 2)
+      // Read row 1
+      dut.io.accumReadAddr.poke(1.U)
+      dut.clock.step(1)
+      val v1raw = dut.io.accumReadData.peek().litValue
+      val v1 = if (v1raw >= (BigInt(1) << (cfg.accumW - 1))) (v1raw - (BigInt(1) << cfg.accumW)).toInt else v1raw.toInt
+      println(s"Accumulator[1] = $v1 (expected: -36)")
+      assert(v1 == -36, s"Row 1: expected -36, got $v1")
     }
   }
 }

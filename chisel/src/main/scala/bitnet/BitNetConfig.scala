@@ -35,6 +35,35 @@ case class BitNetConfig(
     weightDataW / avalonDataW
   }
 
+  // ---- T-MAC parameters ----
+
+  /** Number of activations per LUT group */
+  val groupSize: Int = 4
+  require(numPEs % groupSize == 0, "numPEs must be divisible by groupSize")
+
+  /** Number of T-MAC groups */
+  val numGroups: Int = numPEs / groupSize
+
+  /** Number of entries per group LUT (2^groupSize) */
+  val lutEntries: Int = 1 << groupSize
+
+  /** Bit width of each LUT entry: sum of groupSize INT8 values needs activationW + log2(groupSize) + 1 bits */
+  val lutEntryW: Int = activationW + log2Ceil(groupSize) + 1
+
+  /** Bit width of group output after lut[p_mask] - lut[n_mask] subtraction */
+  val groupOutW: Int = lutEntryW + 1
+
+  /** T-MAC adder tree depth = log2(numGroups) */
+  val tmacTreeDepth: Int = log2(numGroups)
+
+  /** T-MAC adder tree output width */
+  val tmacTreeOutW: Int = groupOutW + tmacTreeDepth
+
+  /** T-MAC adder tree pipeline stages (one register per level) */
+  val tmacTreePipeStages: Int = tmacTreeDepth
+
+  // ---- Legacy PE parameters (kept for AdderTree backward compatibility) ----
+
   /** Bit width for PE output (activation + 1 for sign inversion overflow) */
   val peOutW: Int = activationW + 1
 

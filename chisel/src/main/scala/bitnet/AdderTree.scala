@@ -2,32 +2,39 @@ package bitnet
 
 import chisel3._
 
-/** Pipelined binary adder tree reducing numPEs inputs to one sum.
-  *
-  * 128 [REG] →64 [REG] →32 [REG] →16 [REG] →8 [REG] →4 [REG] →2 [REG] →1
+/** Pipelined binary adder tree reducing numInputs inputs to one sum.
   *
   * Pipeline register inserted at every level to meet timing at 100 MHz.
   * Total latency = treeDepth cycles.
-  * Output sign-extended to accumW bits.
+  * Output sign-extended to outW bits.
+  *
+  * @param numInputs Number of inputs to reduce (must be power of 2)
+  * @param inputW    Bit width of each input (signed)
+  * @param outW      Bit width of output (signed), must be >= inputW + log2(numInputs)
   */
-class AdderTree(implicit val cfg: BitNetConfig) extends Module {
+class AdderTree(numInputs: Int, inputW: Int, outW: Int) extends Module {
+  require(numInputs > 0 && (numInputs & (numInputs - 1)) == 0, "numInputs must be a power of 2")
+
+  private val depth = (math.log(numInputs) / math.log(2)).toInt
+  private val internalW = inputW + depth
+
   val io = IO(new Bundle {
-    val inputs   = Input(Vec(cfg.numPEs, SInt(cfg.peOutW.W)))
-    val valid_in = Input(Bool())
-    val sum      = Output(SInt(cfg.accumW.W))
+    val inputs    = Input(Vec(numInputs, SInt(inputW.W)))
+    val valid_in  = Input(Bool())
+    val sum       = Output(SInt(outW.W))
     val valid_out = Output(Bool())
   })
 
-  // Widen all inputs to treeOutW for headroom
-  var current: Seq[SInt] = (0 until cfg.numPEs).map { i =>
-    val w = Wire(SInt(cfg.treeOutW.W))
+  // Widen all inputs to internalW for headroom
+  var current: Seq[SInt] = (0 until numInputs).map { i =>
+    val w = Wire(SInt(internalW.W))
     w := io.inputs(i)
     w
   }
 
   var validPipe = io.valid_in
 
-  for (_ <- 0 until cfg.treeDepth) {
+  for (_ <- 0 until depth) {
     val half = current.length / 2
     val next = (0 until half).map { i =>
       current(2 * i) +& current(2 * i + 1)
@@ -40,4 +47,10 @@ class AdderTree(implicit val cfg: BitNetConfig) extends Module {
 
   io.sum := current.head
   io.valid_out := validPipe
+}
+
+object AdderTree {
+  /** Convenience constructor using BitNetConfig for T-MAC mode */
+  def tmac(implicit cfg: BitNetConfig): AdderTree =
+    new AdderTree(cfg.numGroups, cfg.groupOutW, cfg.accumW)
 }

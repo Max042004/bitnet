@@ -13,33 +13,30 @@ class AvalonMMReadMaster(addrW: Int, dataW: Int, burstCountW: Int) extends Bundl
   val burstcount    = Output(UInt(burstCountW.W))
 }
 
-/** Streams an entire row of weight tiles from DDR3 via pipelined Avalon burst reads.
+/** Streams weight tiles from DDR3 via pipelined Avalon burst reads.
   *
-  * Pipelined sub-bursts: instead of issuing one large burst per row, issues
-  * multiple sub-bursts of maxBurstLen beats back-to-back. The next sub-burst
-  * is issued as soon as the previous one's read command is accepted (not waiting
-  * for data), keeping multiple reads in the DDR3 pipeline simultaneously.
+  * T-MAC tile-major mode: for each tile position k, streams M weight tiles
+  * (one per output row) sequentially. Uses a single shallow FIFO with
+  * continuous burst reads to keep the DDR3 pipeline saturated.
   *
-  * Double-buffered: two FIFOs (A and B) allow prefetching the next row while
-  * the current row is being consumed. The `swap` signal toggles which FIFO
-  * is the active (consumer) side vs. the fill side.
+  * Weight layout in DDR3 (tile-major):
+  *   tile0: [row0][row1]...[rowM-1]
+  *   tile1: [row0][row1]...[rowM-1]
+  *   ...
   *
-  * When avalonDataW < weightDataW (e.g. 128-bit bus, 256-bit tiles), multiple
-  * bus beats are assembled into one FIFO entry before enqueueing.
+  * Address = baseAddr + tileIdx * tileStride (sequential within burst)
   *
-  * Address = baseAddr + rowIdx * tilesPerRow * (weightDataW / 8)
+  * When avalonDataW < weightDataW, multiple bus beats are assembled into one
+  * FIFO entry before enqueueing.
   */
 class WeightStreamer(implicit val cfg: BitNetConfig) extends Module {
   val io = IO(new Bundle {
-    // Control
-    val startRow = Input(Bool())
-    val baseAddr = Input(UInt(cfg.avalonAddrW.W))
-    val dimK     = Input(UInt(cfg.dimW.W))
-    val rowIdx   = Input(UInt(cfg.dimW.W))
-
-    // Double-buffer control
-    val swap         = Input(Bool())
-    val prefetchDone = Output(Bool())
+    // Control: start streaming M tiles for a given tile position
+    val startTile  = Input(Bool())
+    val baseAddr   = Input(UInt(cfg.avalonAddrW.W))
+    val dimM       = Input(UInt(cfg.dimW.W))
+    val tileIdx    = Input(UInt(cfg.dimW.W))
+    val tileStride = Input(UInt(cfg.avalonAddrW.W))
 
     // Avalon-MM master (bus width)
     val avalon = new AvalonMMReadMaster(cfg.avalonAddrW, cfg.avalonDataW, cfg.burstCountW)
@@ -50,62 +47,41 @@ class WeightStreamer(implicit val cfg: BitNetConfig) extends Module {
     val dequeue    = Input(Bool())
 
     // Status
-    val rowDone = Output(Bool())
+    val streamDone = Output(Bool())
   })
 
   val sIdle :: sBurst :: Nil = Enum(2)
   val state = RegInit(sIdle)
 
-  val busBytesPerBeat = (cfg.avalonDataW / 8)
-  // Physical tile size in DDR3: beatsPerTile bus beats per tile
-  val tileBytesSize   = (cfg.beatsPerTile * busBytesPerBeat)
+  val busBytesPerBeat = cfg.avalonDataW / 8
+  val tileBytesSize   = cfg.beatsPerTile * busBytesPerBeat
+
   val addr = RegInit(0.U(cfg.avalonAddrW.W))
 
   // Pipelined burst tracking
-  val totalBusBeats  = RegInit(0.U(cfg.dimW.W))  // total bus beats for this row
-  val beatsIssued    = RegInit(0.U(cfg.dimW.W))   // bus beats with read command accepted
-  val beatsReceived  = RegInit(0.U(cfg.dimW.W))   // bus beats with data received
+  val totalBusBeats  = RegInit(0.U(32.W))
+  val beatsIssued    = RegInit(0.U(32.W))
+  val beatsReceived  = RegInit(0.U(32.W))
 
-  // Track tiles per row for swap/rowDone
-  val tilesPerRow = RegInit(0.U(cfg.dimW.W))
-  val activeTilesPerRow = RegInit(0.U(cfg.dimW.W))
-  val deqCount = RegInit(0.U(cfg.dimW.W))
+  // Single shallow FIFO (enough depth to absorb DDR3 latency)
+  val fifoDepth = 64
+  val fifo = Module(new Queue(UInt(cfg.weightDataW.W), fifoDepth))
 
-  // Double-buffered FIFOs (internal weight data width)
-  val maxTilesPerRow = cfg.maxDimK / cfg.numPEs
-  val fifoA = Module(new Queue(UInt(cfg.weightDataW.W), maxTilesPerRow))
-  val fifoB = Module(new Queue(UInt(cfg.weightDataW.W), maxTilesPerRow))
-
-  // activeBuf: false = A is active (consumer), B is fill
-  //            true  = B is active (consumer), A is fill
-  val activeBuf = RegInit(false.B)
-
-  // Fill-side FIFO is done when all beats received
-  val fillDoneReg = RegInit(false.B)
-  io.prefetchDone := fillDoneReg
-
-  // Swap logic: toggle activeBuf, reset deqCount, capture tilesPerRow
-  when(io.swap) {
-    activeBuf := !activeBuf
-    deqCount := 0.U
-    activeTilesPerRow := tilesPerRow
-    fillDoneReg := false.B
-  }
+  val doneReg = RegInit(false.B)
+  io.streamDone := doneReg
 
   // --- Beat assembly: collect beatsPerTile bus beats into one weightDataW-bit entry ---
   val fillEnqValid = Wire(Bool())
   val fillEnqBits  = Wire(UInt(cfg.weightDataW.W))
 
   if (cfg.beatsPerTile == 1) {
-    // No assembly needed: each bus beat carries a full tile
     fillEnqValid := io.avalon.readdatavalid
     fillEnqBits  := io.avalon.readdata(cfg.weightDataW - 1, 0)
   } else {
-    // Assemble beatsPerTile bus beats into one FIFO entry
     val assemblyReg = Reg(UInt(cfg.avalonDataW.W))
     val subBeat = RegInit(0.U(log2Ceil(cfg.beatsPerTile).W))
     fillEnqValid := false.B
-    fillEnqBits  := Cat(io.avalon.readdata, assemblyReg)  // {upper, lower}
+    fillEnqBits  := Cat(io.avalon.readdata, assemblyReg)
 
     when(io.avalon.readdatavalid) {
       when(subBeat === (cfg.beatsPerTile - 1).U) {
@@ -118,35 +94,14 @@ class WeightStreamer(implicit val cfg: BitNetConfig) extends Module {
     }
   }
 
-  // Enqueue to fill-side FIFO
-  fifoA.io.enq.valid := Mux(activeBuf, fillEnqValid, false.B)
-  fifoA.io.enq.bits  := fillEnqBits
-  fifoB.io.enq.valid := Mux(!activeBuf, fillEnqValid, false.B)
-  fifoB.io.enq.bits  := fillEnqBits
+  // Enqueue to FIFO
+  fifo.io.enq.valid := fillEnqValid
+  fifo.io.enq.bits  := fillEnqBits
 
-  // Dequeue from active-side FIFO
-  val activeDeqValid = Mux(activeBuf, fifoB.io.deq.valid, fifoA.io.deq.valid)
-  val activeDeqBits  = Mux(activeBuf, fifoB.io.deq.bits, fifoA.io.deq.bits)
-
-  io.weightData := activeDeqBits
-  io.dataReady  := activeDeqValid
-
-  fifoA.io.deq.ready := Mux(!activeBuf, io.dequeue, false.B)
-  fifoB.io.deq.ready := Mux(activeBuf, io.dequeue, false.B)
-
-  // Track dequeues for rowDone on active side
-  when(io.swap) {
-    deqCount := 0.U
-  }.elsewhen((fifoA.io.deq.fire && !activeBuf) || (fifoB.io.deq.fire && activeBuf)) {
-    deqCount := deqCount + 1.U
-  }
-
-  io.rowDone := deqCount === activeTilesPerRow && activeTilesPerRow =/= 0.U
-
-  // Clear fillDone when starting a new fill
-  when(io.startRow && state === sIdle) {
-    fillDoneReg := false.B
-  }
+  // Dequeue interface
+  io.weightData := fifo.io.deq.bits
+  io.dataReady  := fifo.io.deq.valid
+  fifo.io.deq.ready := io.dequeue
 
   // --- Pipelined sub-burst logic ---
   val maxBurst = cfg.maxBurstLen
@@ -160,20 +115,20 @@ class WeightStreamer(implicit val cfg: BitNetConfig) extends Module {
 
   switch(state) {
     is(sIdle) {
-      when(io.startRow) {
-        val tpr = (io.dimK + (cfg.numPEs - 1).U) >> log2Ceil(cfg.numPEs).U
-        tilesPerRow := tpr
-        val busBeats = tpr * cfg.beatsPerTile.U
+      when(io.startTile) {
+        // Compute: total bus beats = dimM * beatsPerTile
+        val busBeats = io.dimM * cfg.beatsPerTile.U
         totalBusBeats := busBeats
         beatsIssued := 0.U
         beatsReceived := 0.U
-        // Row byte offset = rowIdx * tilesPerRow * tileBytesSize
-        addr := io.baseAddr + io.rowIdx * tpr * tileBytesSize.U
+        // Address = baseAddr + tileIdx * tileStride
+        addr := io.baseAddr + io.tileIdx * io.tileStride
+        doneReg := false.B
         state := sBurst
       }
     }
     is(sBurst) {
-      // Issue sub-bursts back-to-back: next burst as soon as previous accepted
+      // Issue sub-bursts back-to-back
       when(beatsIssued < totalBusBeats) {
         io.avalon.read := true.B
         io.avalon.address := addr
@@ -184,14 +139,14 @@ class WeightStreamer(implicit val cfg: BitNetConfig) extends Module {
         }
       }
 
-      // Receive data concurrently (independent of issuing)
+      // Receive data concurrently
       when(io.avalon.readdatavalid) {
         beatsReceived := beatsReceived + 1.U
       }
 
       // Done when all data received
       when(beatsReceived + io.avalon.readdatavalid.asUInt === totalBusBeats) {
-        fillDoneReg := true.B
+        doneReg := true.B
         state := sIdle
       }
     }

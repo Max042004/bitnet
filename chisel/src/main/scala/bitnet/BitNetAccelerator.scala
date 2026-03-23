@@ -16,25 +16,23 @@ class AvalonMMMaster(addrW: Int, dataW: Int, burstCountW: Int) extends Bundle {
   val burstcount    = Output(UInt(burstCountW.W))
 }
 
-/** Top-level BitNet accelerator integrating all sub-modules.
+/** Top-level BitNet accelerator with T-MAC tile-major computation.
   *
   * Architecture:
   *   HPS ──Avalon-MM Slave──► ControlRegs ──► FSM
   *   DDR3 ◄──Avalon-MM Master── WeightStreamer / ActivationLoader / ResultWriter ◄── FSM
-  *   ActivationBuffer ──► ComputeCore (Decoder→PEArray→AdderTree→Accum→Requant) ──► ResultBuffer
+  *   ActivationBuffer ──► ComputeCore (LutBuilder→WeightIndexer→AdderTree→AccumArray) ──► ResultBuffer
   *
-  * Weight prefetch: double-buffered WeightStreamer allows overlapping DDR3
-  * reads for row N+1 while row N is being computed, hiding DDR3 latency.
+  * T-MAC tile-major order: for each tile position k, build LUTs once from
+  * activations, then stream M weight tiles through the lookup pipeline.
+  * LUT build cost (4 cycles) is amortized over M rows.
   *
-  * DDR3 mode: When CTRL[1]=1, activations are loaded from DDR3 via ActivationLoader
-  * before compute, and results are written to DDR3 via ResultWriter after compute.
+  * Weight layout in DDR3 (tile-major):
+  *   [tile0_row0][tile0_row1]...[tile0_rowM-1][tile1_row0]...
   */
 class BitNetAccelerator(implicit val cfg: BitNetConfig) extends Module {
   val io = IO(new Bundle {
-    // Avalon-MM slave (HPS register access)
-    val slave = new AvalonMMSlave()
-
-    // Avalon-MM master (DDR3 reads + writes)
+    val slave  = new AvalonMMSlave()
     val master = new AvalonMMMaster(cfg.avalonAddrW, cfg.avalonDataW, cfg.burstCountW)
   })
 
@@ -46,7 +44,7 @@ class BitNetAccelerator(implicit val cfg: BitNetConfig) extends Module {
   val actLoader   = Module(new ActivationLoader)
   val resWriter   = Module(new ResultWriter)
 
-  // Result buffer: stores raw accumulator values (full precision) for readback
+  // Result buffer: stores raw accumulator values for readback
   val resultMem = SyncReadMem(cfg.maxDimM, SInt(32.W))
   val resultWriteIdx = RegInit(0.U(cfg.dimW.W))
 
@@ -66,23 +64,25 @@ class BitNetAccelerator(implicit val cfg: BitNetConfig) extends Module {
   actBuffer.io.bulkWriteData := actLoader.io.bulkWriteData
   actBuffer.io.bulkWriteBase := actLoader.io.bulkWriteBase
 
-  // ---- Result buffer read from control regs (default port) ----
-  // Muxed with ResultWriter — see below
+  // ---- Result buffer read from control regs ----
   val resReadAddr = Wire(UInt(cfg.dimW.W))
   val resReadData = resultMem.read(resReadAddr)
   controlRegs.io.resReadData := resReadData
 
   // ---- Main FSM ----
-  val sIdle :: sLoadAct :: sStartRow :: sWaitFill :: sSwapAndGo :: sStartPrefetch :: sLoadTile :: sConsumeWeight :: sWaitPipeline :: sRowNext :: sWriteResults :: sDone :: Nil = Enum(12)
+  val sIdle :: sLoadAct :: sClearAccum :: sPresentTile :: sBuildLut :: sStartStream :: sStreamWeights :: sWaitFlush :: sTileNext :: sCopyResults :: sWriteResults :: sDone :: Nil = Enum(12)
   val state = RegInit(sIdle)
 
-  val currentRow = RegInit(0.U(cfg.dimW.W))
   val currentTile = RegInit(0.U(cfg.dimW.W))
+  val currentRow = RegInit(0.U(cfg.dimW.W))
   val tilesPerRow = RegInit(0.U(cfg.dimW.W))
   val totalRows = RegInit(0.U(cfg.dimW.W))
   val dimK = RegInit(0.U(cfg.dimW.W))
   val pipelineFlush = RegInit(0.U(4.W))
   val ddr3Mode = RegInit(false.B)
+  val clearIdx = RegInit(0.U(cfg.dimW.W))
+  val copyIdx = RegInit(0.U(cfg.dimW.W))
+  val copyReadPending = RegInit(false.B)
 
   val busy = state =/= sIdle
   val done = state === sDone
@@ -92,22 +92,22 @@ class BitNetAccelerator(implicit val cfg: BitNetConfig) extends Module {
   controlRegs.io.perfCycles := perfCycles
 
   // ---- Weight streamer defaults ----
-  weightStr.io.startRow := false.B
-  weightStr.io.baseAddr := controlRegs.io.weightBase
-  weightStr.io.dimK := controlRegs.io.dimK
-  weightStr.io.rowIdx := currentRow
-  weightStr.io.dequeue := false.B
-  weightStr.io.swap := false.B
+  weightStr.io.startTile  := false.B
+  weightStr.io.baseAddr   := controlRegs.io.weightBase
+  weightStr.io.dimM       := totalRows
+  weightStr.io.tileIdx    := currentTile
+  weightStr.io.tileStride := controlRegs.io.tileStride
+  weightStr.io.dequeue    := false.B
 
   // ---- ActivationLoader defaults ----
-  actLoader.io.start := false.B
+  actLoader.io.start    := false.B
   actLoader.io.ddr3Addr := controlRegs.io.actDdr3Base
-  actLoader.io.dimK := dimK
+  actLoader.io.dimK     := dimK
 
   // ---- ResultWriter defaults ----
-  resWriter.io.start := false.B
+  resWriter.io.start    := false.B
   resWriter.io.ddr3Addr := controlRegs.io.resDdr3Base
-  resWriter.io.dimM := totalRows
+  resWriter.io.dimM     := totalRows
 
   // ResultWriter reads from resultMem
   resWriter.io.resReadData := resReadData
@@ -115,25 +115,18 @@ class BitNetAccelerator(implicit val cfg: BitNetConfig) extends Module {
   // ResultMem read address mux: ResultWriter during sWriteResults, ControlRegs otherwise
   resReadAddr := Mux(state === sWriteResults, resWriter.io.resReadAddr, controlRegs.io.resReadAddr)
 
-  // ---- Activation buffer tile address default ----
+  // ---- Activation buffer tile address ----
   actBuffer.io.tileOffset := currentTile << log2Ceil(cfg.numPEs).U
 
-  // ---- Compute core connections ----
-  computeCore.io.weightData := weightStr.io.weightData
+  // ---- ComputeCore connections ----
+  computeCore.io.weightData  := weightStr.io.weightData
   computeCore.io.weightValid := false.B
   computeCore.io.activations := actBuffer.io.activations
-  computeCore.io.dimK := dimK
-  computeCore.io.shiftAmt := controlRegs.io.shiftAmt
-  computeCore.io.rowStart := false.B
-  computeCore.io.tileIn := false.B
-
-  // Write raw accumulator to result buffer (skip INT8 requantization for precision)
-  val accumWide = Wire(SInt(32.W))
-  accumWide := computeCore.io.accumOut
-  when(computeCore.io.resultValid) {
-    resultMem.write(resultWriteIdx, accumWide)
-    resultWriteIdx := resultWriteIdx + 1.U
-  }
+  computeCore.io.lutBuildStart := false.B
+  computeCore.io.rowIdx      := currentRow
+  computeCore.io.accumReadAddr := Mux(state === sCopyResults, copyIdx, 0.U)
+  computeCore.io.accumClearEn   := false.B
+  computeCore.io.accumClearAddr := clearIdx
 
   // Performance counter
   when(busy && !done) {
@@ -141,52 +134,48 @@ class BitNetAccelerator(implicit val cfg: BitNetConfig) extends Module {
   }
 
   // ---- Master port mux ----
-  // Time-multiplexed: sLoadAct → actLoader reads, compute → weightStr reads, sWriteResults → resWriter writes
-  // Default: all deasserted
-  io.master.address := 0.U
-  io.master.read := false.B
-  io.master.write := false.B
-  io.master.writedata := 0.U
+  io.master.address    := 0.U
+  io.master.read       := false.B
+  io.master.write      := false.B
+  io.master.writedata  := 0.U
   io.master.byteenable := 0.U
   io.master.burstcount := 0.U
 
   // ActivationLoader Avalon signals
-  actLoader.io.avalon_waitrequest := true.B
+  actLoader.io.avalon_waitrequest   := true.B
   actLoader.io.avalon_readdatavalid := false.B
-  actLoader.io.avalon_readdata := 0.U
+  actLoader.io.avalon_readdata      := 0.U
 
   // WeightStreamer Avalon signals
-  weightStr.io.avalon.waitrequest := true.B
+  weightStr.io.avalon.waitrequest   := true.B
   weightStr.io.avalon.readdatavalid := false.B
-  weightStr.io.avalon.readdata := 0.U
+  weightStr.io.avalon.readdata      := 0.U
 
   // ResultWriter Avalon signals
   resWriter.io.avalon_waitrequest := true.B
 
   when(state === sLoadAct) {
-    // ActivationLoader drives master reads
-    io.master.address := actLoader.io.avalon_address
-    io.master.read := actLoader.io.avalon_read
+    io.master.address   := actLoader.io.avalon_address
+    io.master.read      := actLoader.io.avalon_read
     io.master.burstcount := actLoader.io.avalon_burstcount
-    actLoader.io.avalon_waitrequest := io.master.waitrequest
+    actLoader.io.avalon_waitrequest   := io.master.waitrequest
     actLoader.io.avalon_readdatavalid := io.master.readdatavalid
-    actLoader.io.avalon_readdata := io.master.readdata
+    actLoader.io.avalon_readdata      := io.master.readdata
   }.elsewhen(state === sWriteResults) {
-    // ResultWriter drives master writes
-    io.master.address := resWriter.io.avalon_address
-    io.master.write := resWriter.io.avalon_write
-    io.master.writedata := resWriter.io.avalon_writedata
+    io.master.address    := resWriter.io.avalon_address
+    io.master.write      := resWriter.io.avalon_write
+    io.master.writedata  := resWriter.io.avalon_writedata
     io.master.byteenable := resWriter.io.avalon_byteenable
     io.master.burstcount := resWriter.io.avalon_burstcount
     resWriter.io.avalon_waitrequest := io.master.waitrequest
   }.otherwise {
     // WeightStreamer drives master reads (during compute states)
-    io.master.address := weightStr.io.avalon.address
-    io.master.read := weightStr.io.avalon.read
+    io.master.address   := weightStr.io.avalon.address
+    io.master.read      := weightStr.io.avalon.read
     io.master.burstcount := weightStr.io.avalon.burstcount
-    weightStr.io.avalon.waitrequest := io.master.waitrequest
+    weightStr.io.avalon.waitrequest   := io.master.waitrequest
     weightStr.io.avalon.readdatavalid := io.master.readdatavalid
-    weightStr.io.avalon.readdata := io.master.readdata
+    weightStr.io.avalon.readdata      := io.master.readdata
   }
 
   // ---- FSM ----
@@ -196,113 +185,137 @@ class BitNetAccelerator(implicit val cfg: BitNetConfig) extends Module {
         dimK := controlRegs.io.dimK
         totalRows := controlRegs.io.dimM
         tilesPerRow := (controlRegs.io.dimK + (cfg.numPEs - 1).U) >> log2Ceil(cfg.numPEs).U
-        currentRow := 0.U
         currentTile := 0.U
-        resultWriteIdx := 0.U
+        currentRow := 0.U
         perfCycles := 0.U
         ddr3Mode := controlRegs.io.ddr3Mode
         when(controlRegs.io.ddr3Mode) {
           state := sLoadAct
         }.otherwise {
-          state := sStartRow
+          state := sClearAccum
+          clearIdx := 0.U
         }
       }
     }
+
     is(sLoadAct) {
-      // Pulse start on entry (one cycle only)
       actLoader.io.start := !actLoader.io.done && (RegNext(state) =/= sLoadAct)
       when(actLoader.io.done) {
-        state := sStartRow
+        state := sClearAccum
+        clearIdx := 0.U
       }
     }
-    is(sStartRow) {
-      // Fill the fill-side FIFO with the first row
-      weightStr.io.startRow := true.B
-      weightStr.io.rowIdx := currentRow
-      state := sWaitFill
-    }
-    is(sWaitFill) {
-      // Wait for the fill-side FIFO to finish loading
-      when(weightStr.io.prefetchDone) {
-        state := sSwapAndGo
+
+    is(sClearAccum) {
+      // Clear all M accumulator entries to zero
+      computeCore.io.accumClearEn := true.B
+      computeCore.io.accumClearAddr := clearIdx
+      clearIdx := clearIdx + 1.U
+      when(clearIdx >= totalRows - 1.U) {
+        state := sPresentTile
       }
     }
-    is(sSwapAndGo) {
-      // Swap: make the filled FIFO the active one
-      weightStr.io.swap := true.B
-      currentTile := 0.U
-      // Start prefetch on next cycle (after swap register updates)
-      state := sStartPrefetch
+
+    is(sPresentTile) {
+      // Present tile address to activation buffer (SyncReadMem: data valid next cycle)
+      actBuffer.io.tileOffset := currentTile << log2Ceil(cfg.numPEs).U
+      state := sBuildLut
     }
-    is(sStartPrefetch) {
-      // Now activeBuf has been updated, so startRow fills the correct FIFO
-      val nextRow = currentRow + 1.U
-      when(nextRow < totalRows) {
-        weightStr.io.startRow := true.B
-        weightStr.io.rowIdx := nextRow
+
+    is(sBuildLut) {
+      // Activations are now valid from the BRAM read.
+      // Start LUT builder (takes 4 cycles)
+      computeCore.io.lutBuildStart := RegNext(state) =/= sBuildLut
+      when(computeCore.io.lutBuildDone) {
+        state := sStartStream
       }
-      state := sLoadTile
     }
-    is(sLoadTile) {
-      // Present tile 0 address to BRAM (data valid next cycle)
-      actBuffer.io.tileOffset := 0.U
-      // Reset accumulator for new row
-      computeCore.io.rowStart := true.B
-      state := sConsumeWeight
+
+    is(sStartStream) {
+      // Pulse startTile to begin DDR3 weight fetch for this tile position
+      weightStr.io.startTile := true.B
+      weightStr.io.tileIdx := currentTile
+      currentRow := 0.U
+      state := sStreamWeights
     }
-    is(sConsumeWeight) {
-      // BRAM output for currentTile is valid (address was presented last cycle)
+
+    is(sStreamWeights) {
+      // Dequeue weight tiles one per cycle, feed to compute core
       when(weightStr.io.dataReady) {
         weightStr.io.dequeue := true.B
         computeCore.io.weightValid := true.B
-        computeCore.io.tileIn := true.B
-        val nextTile = currentTile + 1.U
-        when(nextTile >= tilesPerRow) {
-          // All tiles for this row done, wait for pipeline
+        computeCore.io.rowIdx := currentRow
+        val nextRow = currentRow + 1.U
+        when(nextRow >= totalRows) {
+          // All rows for this tile done
           pipelineFlush := 0.U
-          state := sWaitPipeline
+          state := sWaitFlush
         }.otherwise {
-          currentTile := nextTile
-          // Prefetch next tile's activations (data valid next cycle)
-          actBuffer.io.tileOffset := nextTile << log2Ceil(cfg.numPEs).U
-          state := sConsumeWeight
+          currentRow := nextRow
         }
       }
     }
-    is(sWaitPipeline) {
-      // Wait for adder tree pipeline + requantize to flush
+
+    is(sWaitFlush) {
+      // Wait for adder tree pipeline + accumulator write-back to drain
+      // Pipeline delay: 1 (weightIndexer) + tmacTreePipeStages (adder tree) + 1 (accum RMW)
       pipelineFlush := pipelineFlush + 1.U
-      when(pipelineFlush >= (cfg.treePipeStages + 3).U) {
-        state := sRowNext
+      when(pipelineFlush >= (cfg.tmacTreePipeStages + 3).U) {
+        state := sTileNext
       }
     }
-    is(sRowNext) {
-      val nextRow = currentRow + 1.U
-      when(nextRow >= totalRows) {
-        when(ddr3Mode) {
-          state := sWriteResults
-        }.otherwise {
-          state := sDone
-        }
+
+    is(sTileNext) {
+      val nextTile = currentTile + 1.U
+      when(nextTile >= tilesPerRow) {
+        // All tiles done → copy results
+        state := sCopyResults
+        copyIdx := 0.U
+        copyReadPending := false.B
+        resultWriteIdx := 0.U
       }.otherwise {
-        currentRow := nextRow
-        currentTile := 0.U
-        // Prefetch was already started in sSwapAndGo.
-        // Check if it's done; if so, swap immediately, otherwise wait.
-        when(weightStr.io.prefetchDone) {
-          state := sSwapAndGo
+        currentTile := nextTile
+        state := sPresentTile
+      }
+    }
+
+    is(sCopyResults) {
+      // Copy M accumulators from AccumulatorArray → resultMem
+      // AccumulatorArray uses SyncReadMem: present addr cycle N, data available cycle N+1.
+      // copyIdx tracks the address to present; copyReadPending means data is available.
+      // Present next read address early so data is ready next cycle.
+      computeCore.io.accumReadAddr := copyIdx
+
+      when(!copyReadPending) {
+        // First cycle: just present addr 0, data not yet valid
+        copyReadPending := true.B
+        copyIdx := copyIdx + 1.U  // Advance so next cycle presents addr 1
+      }.otherwise {
+        // Data from previous cycle's address is now valid
+        val accumWide = Wire(SInt(32.W))
+        accumWide := computeCore.io.accumReadData
+        resultMem.write(resultWriteIdx, accumWide)
+        resultWriteIdx := resultWriteIdx + 1.U
+
+        when(resultWriteIdx + 1.U >= totalRows) {
+          when(ddr3Mode) {
+            state := sWriteResults
+          }.otherwise {
+            state := sDone
+          }
         }.otherwise {
-          state := sWaitFill
+          copyIdx := copyIdx + 1.U  // Present next address
         }
       }
     }
+
     is(sWriteResults) {
-      // Pulse start on entry (one cycle only)
       resWriter.io.start := !resWriter.io.done && (RegNext(state) =/= sWriteResults)
       when(resWriter.io.done) {
         state := sDone
       }
     }
+
     is(sDone) {
       state := sIdle
     }
