@@ -78,6 +78,7 @@ class BitNetAccelerator(implicit val cfg: BitNetConfig) extends Module {
   val tilesPerRow = RegInit(0.U(cfg.dimW.W))
   val totalRows = RegInit(0.U(cfg.dimW.W))
   val dimK = RegInit(0.U(cfg.dimW.W))
+  val currentTileAddr = RegInit(0.U(cfg.avalonAddrW.W))  // Pre-computed tile DDR3 address
   val pipelineFlush = RegInit(0.U(4.W))
   val ddr3Mode = RegInit(false.B)
   val clearIdx = RegInit(0.U(cfg.dimW.W))
@@ -93,10 +94,8 @@ class BitNetAccelerator(implicit val cfg: BitNetConfig) extends Module {
 
   // ---- Weight streamer defaults ----
   weightStr.io.startTile  := false.B
-  weightStr.io.baseAddr   := controlRegs.io.weightBase
+  weightStr.io.tileAddr   := currentTileAddr
   weightStr.io.dimM       := totalRows
-  weightStr.io.tileIdx    := currentTile
-  weightStr.io.tileStride := controlRegs.io.tileStride
   weightStr.io.dequeue    := false.B
 
   // ---- ActivationLoader defaults ----
@@ -187,6 +186,7 @@ class BitNetAccelerator(implicit val cfg: BitNetConfig) extends Module {
         tilesPerRow := (controlRegs.io.dimK + (cfg.numPEs - 1).U) >> log2Ceil(cfg.numPEs).U
         currentTile := 0.U
         currentRow := 0.U
+        currentTileAddr := controlRegs.io.weightBase  // First tile starts at weight base
         perfCycles := 0.U
         ddr3Mode := controlRegs.io.ddr3Mode
         when(controlRegs.io.ddr3Mode) {
@@ -234,7 +234,6 @@ class BitNetAccelerator(implicit val cfg: BitNetConfig) extends Module {
     is(sStartStream) {
       // Pulse startTile to begin DDR3 weight fetch for this tile position
       weightStr.io.startTile := true.B
-      weightStr.io.tileIdx := currentTile
       currentRow := 0.U
       state := sStreamWeights
     }
@@ -275,6 +274,8 @@ class BitNetAccelerator(implicit val cfg: BitNetConfig) extends Module {
         resultWriteIdx := 0.U
       }.otherwise {
         currentTile := nextTile
+        // Advance tile address by stride (addition, no multiply → zero DSP)
+        currentTileAddr := currentTileAddr + controlRegs.io.tileStride
         state := sPresentTile
       }
     }

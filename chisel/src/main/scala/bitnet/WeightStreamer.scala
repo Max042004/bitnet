@@ -33,10 +33,8 @@ class WeightStreamer(implicit val cfg: BitNetConfig) extends Module {
   val io = IO(new Bundle {
     // Control: start streaming M tiles for a given tile position
     val startTile  = Input(Bool())
-    val baseAddr   = Input(UInt(cfg.avalonAddrW.W))
+    val tileAddr   = Input(UInt(cfg.avalonAddrW.W))  // Pre-computed tile base address
     val dimM       = Input(UInt(cfg.dimW.W))
-    val tileIdx    = Input(UInt(cfg.dimW.W))
-    val tileStride = Input(UInt(cfg.avalonAddrW.W))
 
     // Avalon-MM master (bus width)
     val avalon = new AvalonMMReadMaster(cfg.avalonAddrW, cfg.avalonDataW, cfg.burstCountW)
@@ -117,12 +115,13 @@ class WeightStreamer(implicit val cfg: BitNetConfig) extends Module {
     is(sIdle) {
       when(io.startTile) {
         // Compute: total bus beats = dimM * beatsPerTile
+        // beatsPerTile is a compile-time constant, so this synthesizes to a shift
         val busBeats = io.dimM * cfg.beatsPerTile.U
         totalBusBeats := busBeats
         beatsIssued := 0.U
         beatsReceived := 0.U
-        // Address = baseAddr + tileIdx * tileStride
-        addr := io.baseAddr + io.tileIdx * io.tileStride
+        // Use pre-computed tile address (eliminates runtime multiply → zero DSP)
+        addr := io.tileAddr
         doneReg := false.B
         state := sBurst
       }

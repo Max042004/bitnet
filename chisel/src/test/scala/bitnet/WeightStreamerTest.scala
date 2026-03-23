@@ -11,11 +11,9 @@ class WeightStreamerTest extends AnyFlatSpec with ChiselScalatestTester {
 
   it should "stream a single tile for M=1 row" in {
     test(new WeightStreamer) { dut =>
-      // M=1, tileStride = 1 * 16 = 16 bytes (dimM * tileBytesSize)
-      dut.io.baseAddr.poke(0x1000.U)
+      // M=1, pre-computed tile address = 0x1000
+      dut.io.tileAddr.poke(0x1000.U)
       dut.io.dimM.poke(1.U)
-      dut.io.tileIdx.poke(0.U)
-      dut.io.tileStride.poke(16.U)
 
       dut.io.avalon.waitrequest.poke(false.B)
       dut.io.avalon.readdatavalid.poke(false.B)
@@ -55,11 +53,9 @@ class WeightStreamerTest extends AnyFlatSpec with ChiselScalatestTester {
 
   it should "stream M=4 tiles sequentially" in {
     test(new WeightStreamer) { dut =>
-      // M=4, tileStride = 4 * 16 = 64 bytes
-      dut.io.baseAddr.poke(0x0.U)
+      // M=4, pre-computed tile address = 0x0
+      dut.io.tileAddr.poke(0x0.U)
       dut.io.dimM.poke(4.U)
-      dut.io.tileIdx.poke(0.U)
-      dut.io.tileStride.poke(64.U)
 
       dut.io.avalon.waitrequest.poke(false.B)
       dut.io.avalon.readdatavalid.poke(false.B)
@@ -95,14 +91,11 @@ class WeightStreamerTest extends AnyFlatSpec with ChiselScalatestTester {
     }
   }
 
-  it should "compute correct address for tile 1" in {
+  it should "use pre-computed tile address directly" in {
     test(new WeightStreamer) { dut =>
-      // tileIdx=1, dimM=2, tileStride = dimM * tileBytesSize = 2 * 16 = 32
-      // addr = base + tileIdx * tileStride = 0 + 1 * 32 = 32
-      dut.io.baseAddr.poke(0.U)
+      // Pre-computed: base(0) + tileIdx(1) * stride(32) = 32
+      dut.io.tileAddr.poke(32.U)
       dut.io.dimM.poke(2.U)
-      dut.io.tileIdx.poke(1.U)
-      dut.io.tileStride.poke(32.U)
 
       dut.io.avalon.waitrequest.poke(false.B)
       dut.io.avalon.readdatavalid.poke(false.B)
@@ -120,10 +113,8 @@ class WeightStreamerTest extends AnyFlatSpec with ChiselScalatestTester {
 
   it should "handle waitrequest delays" in {
     test(new WeightStreamer) { dut =>
-      dut.io.baseAddr.poke(0x2000.U)
+      dut.io.tileAddr.poke(0x2000.U)
       dut.io.dimM.poke(1.U)
-      dut.io.tileIdx.poke(0.U)
-      dut.io.tileStride.poke(16.U)
 
       dut.io.avalon.waitrequest.poke(true.B)
       dut.io.avalon.readdatavalid.poke(false.B)
