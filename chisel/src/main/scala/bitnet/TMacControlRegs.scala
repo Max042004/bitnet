@@ -30,6 +30,7 @@ class TMacControlRegs(implicit val cfg: TMacConfig) extends Module {
     val signBase   = Output(UInt(cfg.avalonAddrW.W))
     val dimM       = Output(UInt(cfg.dimW.W))
     val dimK       = Output(UInt(cfg.dimW.W))
+    val dimN3      = Output(UInt(cfg.dimW.W))
     val perfCycles = Input(UInt(32.W))
 
     // Activation buffer write port
@@ -51,6 +52,7 @@ class TMacControlRegs(implicit val cfg: TMacConfig) extends Module {
   val regSignBase    = RegInit(0.U(cfg.avalonAddrW.W))
   val regDimM        = RegInit(0.U(cfg.dimW.W))
   val regDimK        = RegInit(0.U(cfg.dimW.W))
+  val regDimN3       = RegInit(0.U(cfg.dimW.W))
   val regStart       = WireDefault(false.B)
   val statusDone     = RegInit(false.B)
   val regActDdr3Base = RegInit(0.U(cfg.avalonAddrW.W))
@@ -67,6 +69,7 @@ class TMacControlRegs(implicit val cfg: TMacConfig) extends Module {
   io.signBase    := regSignBase
   io.dimM        := regDimM
   io.dimK        := regDimK
+  io.dimN3       := regDimN3
   io.actDdr3Base := regActDdr3Base
   io.resDdr3Base := regResDdr3Base
   io.ddr3Mode    := regDdr3Mode
@@ -95,6 +98,7 @@ class TMacControlRegs(implicit val cfg: TMacConfig) extends Module {
       is(0x0C.U) { regDimM := io.avalon.writedata }
       is(0x10.U) { regDimK := io.avalon.writedata }
       is(0x14.U) { regSignBase := io.avalon.writedata }
+      is(0x1C.U) { regDimN3 := io.avalon.writedata }
       is(0x28.U) { regActDdr3Base := io.avalon.writedata }
       is(0x2C.U) { regResDdr3Base := io.avalon.writedata }
     }
@@ -119,6 +123,7 @@ class TMacControlRegs(implicit val cfg: TMacConfig) extends Module {
       is(0x10.U) { regReadData := regDimK }
       is(0x14.U) { regReadData := regSignBase }
       is(0x18.U) { regReadData := io.perfCycles }
+      is(0x1C.U) { regReadData := regDimN3 }
       is(0x28.U) { regReadData := regActDdr3Base }
       is(0x2C.U) { regReadData := regResDdr3Base }
     }

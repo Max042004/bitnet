@@ -100,9 +100,9 @@ class TMacAccelerator(implicit val cfg: TMacConfig) extends Module {
   val pipelineFlush = RegInit(0.U(4.W))
   val ddr3Mode = RegInit(false.B)
 
-  // Pipeline depth: 1 (BRAM latency for nibData/signData) + 1 (nibble/sign pipeline reg)
-  //                + 1 (engine pipeline reg) + treeDepth (adder tree) + 1 (accum)
-  val totalPipeLatency = (1 + 1 + 1 + cfg.treeDepth + 1).U
+  // Pipeline depth: 1 (BRAM latency) + 1 (nibble/sign align) + 1 (LUT MUX reg)
+  //                + 1 (sign correction + engine reg) + treeDepth (adder tree) + 1 (accum)
+  val totalPipeLatency = (1 + 1 + 1 + 1 + cfg.treeDepth + 1).U
 
   val busy = state =/= sIdle
   val done = state === sDone
@@ -116,6 +116,7 @@ class TMacAccelerator(implicit val cfg: TMacConfig) extends Module {
   weightStr.io.nibBase  := controlRegs.io.nibBase
   weightStr.io.signBase := controlRegs.io.signBase
   weightStr.io.dimK     := dimK
+  weightStr.io.dimN3    := controlRegs.io.dimN3
   weightStr.io.rowIdx   := currentRow
   weightStr.io.swap     := false.B
   weightStr.io.tileIdx  := currentTile
@@ -202,7 +203,7 @@ class TMacAccelerator(implicit val cfg: TMacConfig) extends Module {
       when(controlRegs.io.start) {
         dimK := controlRegs.io.dimK
         totalRows := controlRegs.io.dimM
-        val n3 = controlRegs.io.dimK / cfg.groupSize.U
+        val n3 = controlRegs.io.dimN3
         numGroups := n3
         tilesPerRow := (n3 + (cfg.numEngines - 1).U) / cfg.numEngines.U
         currentRow := 0.U

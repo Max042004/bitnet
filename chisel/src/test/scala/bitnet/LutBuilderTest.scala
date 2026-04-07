@@ -45,9 +45,10 @@ class LutBuilderTest extends AnyFlatSpec with ChiselScalatestTester {
       dut.io.actData0.poke(a0.S)
       dut.io.actData1.poke(a1.S)
       dut.io.actData2.poke(a2.S)
-      dut.clock.step(1)
+      dut.clock.step(1)  // sRead → sCompute (register entries)
+      dut.clock.step(1)  // sCompute → sWrite
 
-      // sCompute state: LUT write should happen
+      // sWrite state: LUT write should happen
       assert(dut.io.lutWriteEn.peek().litToBoolean, "Expected LUT write enable")
       assert(dut.io.lutWriteBank.peek().litValue == 0, "Expected bank 0 for group 0")
       assert(dut.io.lutWriteAddr.peek().litValue == 0, "Expected addr 0 for group 0")
@@ -88,7 +89,8 @@ class LutBuilderTest extends AnyFlatSpec with ChiselScalatestTester {
         dut.io.actData0.poke(a0.S)
         dut.io.actData1.poke(a1.S)
         dut.io.actData2.poke(a2.S)
-        dut.clock.step(1) // sRead → sCompute
+        dut.clock.step(1) // sRead → sCompute (register entries)
+        dut.clock.step(1) // sCompute → sWrite
 
         // Verify write
         assert(dut.io.lutWriteEn.peek().litToBoolean, s"Group $g: expected write enable")

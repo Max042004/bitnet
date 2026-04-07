@@ -58,37 +58,33 @@ class TMacComputeCore(implicit val cfg: TMacConfig) extends Module {
   val signsD1   = RegNext(io.signs)
   val tileValidD1 = RegNext(io.tileValid, false.B)
 
-  val engineResults = Wire(Vec(cfg.numEngines, SInt(cfg.engineOutW.W)))
+  // --- Stage 2a: 16:1 LUT MUX (registered to break timing) ---
+  val lutEntryRegs = Reg(Vec(cfg.numEngines, SInt(cfg.lutWidth.W)))
+  val signsD2 = RegNext(signsD1)
+  val tileValidD2 = RegNext(tileValidD1, false.B)
 
   for (e <- 0 until cfg.numEngines) {
-    // Extract 4-bit nibble for this engine
     val nibble = nibblesD1(e * cfg.nibbleW + cfg.nibbleW - 1, e * cfg.nibbleW)
-
-    // Extract sign bit for this engine
-    val sign = signsD1(e)
-
-    // LUT word: 256 bits = 16 entries × 16 bits, entry[0] at LSB
     val lutWord = io.lutReadData(e)
 
-    // 16:1 MUX to select the LUT entry by nibble
-    val lutEntry = Wire(SInt(cfg.lutWidth.W))
-    lutEntry := MuxLookup(nibble, 0.S)(
+    lutEntryRegs(e) := MuxLookup(nibble, 0.S)(
       (0 until cfg.lutEntries).map(i =>
         i.U -> lutWord(i * cfg.lutWidth + cfg.lutWidth - 1, i * cfg.lutWidth).asSInt
       )
     )
+  }
 
-    // Sign correction: negate if sign bit is set
-    val result = Wire(SInt(cfg.engineOutW.W))
-    result := Mux(sign, -lutEntry, lutEntry)
-    engineResults(e) := result
+  // --- Stage 2b: Sign correction on registered LUT entries ---
+  val engineResults = Wire(Vec(cfg.numEngines, SInt(cfg.engineOutW.W)))
+  for (e <- 0 until cfg.numEngines) {
+    engineResults(e) := Mux(signsD2(e), -lutEntryRegs(e), lutEntryRegs(e))
   }
 
   // Pipeline register between engines and adder tree
   val engineRegs = Reg(Vec(cfg.numEngines, SInt(cfg.engineOutW.W)))
   val engineValidReg = RegInit(false.B)
   engineRegs := engineResults
-  engineValidReg := tileValidD1
+  engineValidReg := tileValidD2
 
   // --- Adder tree: 32 inputs → 1 sum, 5 pipeline stages ---
   var current: Seq[SInt] = (0 until cfg.numEngines).map { i =>

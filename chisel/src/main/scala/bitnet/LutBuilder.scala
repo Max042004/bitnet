@@ -44,11 +44,18 @@ class LutBuilder(implicit val cfg: TMacConfig) extends Module {
     val lutWriteData = Output(UInt(cfg.lutWordW.W))
   })
 
-  val sIdle :: sRead :: sCompute :: sDone :: Nil = Enum(4)
+  // Pipeline: sRead → sCompute (register 16 entries) → sWrite (to LutBram).
+  // Inserting the sCompute register stage splits the BRAM→combinational→BRAM
+  // path that was the 100 MHz critical path (6 logic levels, 13 ns).
+  val sIdle :: sRead :: sCompute :: sWrite :: sDone :: Nil = Enum(5)
   val state = RegInit(sIdle)
 
   val groupIdx = RegInit(0.U(cfg.dimW.W))
   val totalGroups = RegInit(0.U(cfg.dimW.W))
+
+  // Registered LUT entries (stage between activation read and LutBram write)
+  val entriesReg = Reg(Vec(cfg.lutEntries, SInt(cfg.lutWidth.W)))
+  val groupIdxD2 = RegInit(0.U(cfg.dimW.W))
 
   // Activation read addresses (group g → activations g*3, g*3+1, g*3+2)
   val baseIdx = groupIdx * 3.U
@@ -79,7 +86,8 @@ class LutBuilder(implicit val cfg: TMacConfig) extends Module {
       state := sCompute
     }
     is(sCompute) {
-      // BRAM data is now valid for groupIdxD1
+      // BRAM data is now valid for groupIdxD1. Compute 16 entries and
+      // *register* them — this is the new pipeline boundary.
       val a0 = io.actData0.asSInt
       val a1 = io.actData1.asSInt
       val a2 = io.actData2.asSInt
@@ -89,37 +97,37 @@ class LutBuilder(implicit val cfg: TMacConfig) extends Module {
       val a1w = Wire(SInt(cfg.lutWidth.W)); a1w := a1
       val a2w = Wire(SInt(cfg.lutWidth.W)); a2w := a2
 
-      // Compute all 16 LUT entries (pure combinational, 10 adders)
-      val entries = Wire(Vec(cfg.lutEntries, SInt(cfg.lutWidth.W)))
-      entries(0)  := 0.S
-      entries(1)  := a2w
-      entries(2)  := a1w
-      entries(3)  := a0w
-      entries(4)  := a1w + a2w
-      entries(5)  := a0w + a2w
-      entries(6)  := a0w + a1w
-      entries(7)  := a1w - a2w
-      entries(8)  := a0w - a2w
-      entries(9)  := a0w - a1w
-      entries(10) := a0w + a1w + a2w
-      entries(11) := a0w + a1w - a2w
-      entries(12) := a0w - a1w + a2w
-      entries(13) := a0w - a1w - a2w
-      entries(14) := 0.S
-      entries(15) := 0.S
+      entriesReg(0)  := 0.S
+      entriesReg(1)  := a2w
+      entriesReg(2)  := a1w
+      entriesReg(3)  := a0w
+      entriesReg(4)  := a1w + a2w
+      entriesReg(5)  := a0w + a2w
+      entriesReg(6)  := a0w + a1w
+      entriesReg(7)  := a1w - a2w
+      entriesReg(8)  := a0w - a2w
+      entriesReg(9)  := a0w - a1w
+      entriesReg(10) := a0w + a1w + a2w
+      entriesReg(11) := a0w + a1w - a2w
+      entriesReg(12) := a0w - a1w + a2w
+      entriesReg(13) := a0w - a1w - a2w
+      entriesReg(14) := 0.S
+      entriesReg(15) := 0.S
 
-      // Pack into 256-bit word: entry[0] in LSB, entry[15] in MSB
+      groupIdxD2 := groupIdxD1
+      state := sWrite
+    }
+    is(sWrite) {
+      // Registered entries → LutBram. Short combinational path: REG → BRAM.
       val packed = Wire(UInt(cfg.lutWordW.W))
-      packed := Cat(entries.reverse.map(_.asUInt))
+      packed := Cat(entriesReg.reverse.map(_.asUInt))
 
-      // Write to LUT BRAM
       io.lutWriteEn   := true.B
-      io.lutWriteBank := groupIdxD1(bankSelW - 1, 0)
-      io.lutWriteAddr := (groupIdxD1 >> bankSelW.U)(bankAddrW - 1, 0)
+      io.lutWriteBank := groupIdxD2(bankSelW - 1, 0)
+      io.lutWriteAddr := (groupIdxD2 >> bankSelW.U)(bankAddrW - 1, 0)
       io.lutWriteData := packed
 
-      // Advance to next group
-      val nextGroup = groupIdxD1 + 1.U
+      val nextGroup = groupIdxD2 + 1.U
       when(nextGroup >= totalGroups) {
         state := sDone
       }.otherwise {

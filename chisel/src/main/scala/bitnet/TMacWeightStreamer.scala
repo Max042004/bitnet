@@ -27,6 +27,7 @@ class TMacWeightStreamer(implicit val cfg: TMacConfig) extends Module {
     val nibBase  = Input(UInt(cfg.avalonAddrW.W))
     val signBase = Input(UInt(cfg.avalonAddrW.W))
     val dimK     = Input(UInt(cfg.dimW.W))
+    val dimN3    = Input(UInt(cfg.dimW.W))
     val rowIdx   = Input(UInt(cfg.dimW.W))
 
     // Double-buffer control
@@ -82,6 +83,10 @@ class TMacWeightStreamer(implicit val cfg: TMacConfig) extends Module {
 
   io.tilesPerRow := tilesPerRowReg
 
+  // n3 = dimK / 3 is supplied directly by the HPS via a dedicated control
+  // register, eliminating a 17-level combinational divider that previously
+  // dominated the critical path at 100 MHz.
+
   // Burst length calculation
   val totalBeats = Mux(state === sNibBurst, totalNibBeats, totalSignBeats)
   val remainingBeats = totalBeats - beatsIssued
@@ -96,20 +101,41 @@ class TMacWeightStreamer(implicit val cfg: TMacConfig) extends Module {
   val nibWriteIdx = RegInit(0.U(cfg.dimW.W))
   val signWriteIdx = RegInit(0.U(cfg.dimW.W))
 
+  // Per-GEMV row strides (bytes). Computed once on row 0 and reused thereafter
+  // so that subsequent rows accumulate (base += stride) instead of recomputing
+  // rowIdx * stride, eliminating two variable×variable LUT multipliers.
+  val nibRowStride  = RegInit(0.U(cfg.avalonAddrW.W))
+  val signRowStride = RegInit(0.U(cfg.avalonAddrW.W))
+  val nibRowBase    = RegInit(0.U(cfg.avalonAddrW.W))
+  val signRowBase   = RegInit(0.U(cfg.avalonAddrW.W))
+
   switch(state) {
     is(sIdle) {
       when(io.startRow) {
         fillDoneReg := false.B
-        // Compute dimensions
-        val n3 = io.dimK / cfg.groupSize.U
+        // n3 supplied by HPS (no on-chip divider)
+        val n3 = io.dimN3
         val tpr = (n3 + (cfg.numEngines - 1).U) / cfg.numEngines.U
         val sbr = (n3 + (cfg.signsPerBeat - 1).U) / cfg.signsPerBeat.U
         tilesPerRowReg := tpr
         totalNibBeats := tpr
         totalSignBeats := sbr
 
-        // Start nibble burst
-        addr := io.nibBase + io.rowIdx * tpr * busBytesPerBeat.U
+        // tpr/sbr × 16 → left-shift-by-4 (busBytesPerBeat = 16 is const).
+        val nibStride  = (tpr << 4).asUInt
+        val signStride = (sbr << 4).asUInt
+
+        // On row 0: initialize bases to the array bases. On row N>0: advance
+        // the previous base by one stride. No variable×variable multiplies.
+        val newNibBase  = Mux(io.rowIdx === 0.U, io.nibBase,  nibRowBase  + nibRowStride)
+        val newSignBase = Mux(io.rowIdx === 0.U, io.signBase, signRowBase + signRowStride)
+        nibRowStride  := nibStride
+        signRowStride := signStride
+        nibRowBase    := newNibBase
+        signRowBase   := newSignBase
+
+        // Start nibble burst from this row's nibble base
+        addr := newNibBase
         beatsIssued := 0.U
         beatsReceived := 0.U
         nibWriteIdx := 0.U
@@ -139,8 +165,8 @@ class TMacWeightStreamer(implicit val cfg: TMacConfig) extends Module {
 
       // Transition to sign burst when all nibble data received
       when(beatsReceived + io.avalon.readdatavalid.asUInt === totalNibBeats) {
-        // Set up sign burst
-        addr := io.signBase + io.rowIdx * totalSignBeats * busBytesPerBeat.U
+        // Use the per-row signRowBase that was latched in sIdle. No multiply.
+        addr := signRowBase
         beatsIssued := 0.U
         beatsReceived := 0.U
         signWriteIdx := 0.U
