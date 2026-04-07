@@ -1,266 +1,195 @@
-# BitNet DSP-Free FPGA Inference Accelerator
+# T-MAC FPGA Inference Accelerator (DSP-Free, BitNet b1.58)
 
-A DSP-free inference accelerator for BitNet b1.58 ternary weight networks, targeting the **DE10-Nano** (Altera Cyclone V SE SoC). All computation uses LUTs, registers, and BRAM only — zero DSP blocks required.
+A **DSP-free, table-based** inference accelerator for BitNet b1.58 ternary weight networks, targeting the **DE10-Nano** (Altera Cyclone V SE SoC). All computation uses LUTs, registers, and BRAM only — **zero DSP blocks**.
 
-Successfully runs **BitMamba 255M** model inference on the DE10-Nano.
+The accelerator uses **T-MAC (Table-based MAC)**: instead of per-element multiply-accumulate, it pre-computes 16 possible linear combinations of every 3 activations into a LUT, then walks the weight matrix as a stream of 4-bit nibble indices + 1-bit signs. The main loop becomes "look up + conditional negate + add" — no multipliers, no DSP blocks.
+
+Primary target model: **microsoft/bitnet-b1.58-2B-4T**. Secondary: **BitMamba 1B**.
 
 ## Key Idea
 
-BitNet b1.58 constrains weights to {-1, 0, +1}. This turns multiplication into simple control logic:
+For every group of 3 activations `(a0, a1, a2)`, there are only 16 distinct partial sums of the form `±a0 ± a1 ± a2` (plus zero). Pre-computing these into a LUT once per layer means each weight group only needs:
 
-| Weight | Operation |
-|--------|-----------|
-| 0 | Output zero (AND gate) |
-| +1 | Pass activation through |
-| -1 | Negate activation (2's complement) |
+1. A 4-bit nibble → indexes one of 16 LUT entries
+2. A 1-bit sign  → conditional 2's-complement negate
+3. Add into the running accumulator
 
-The result: a full matrix-vector engine that fits on low-end FPGAs with no DSP usage.
+| Operation | Hardware cost |
+|-----------|---------------|
+| LUT entry lookup | 16:1 MUX on a 256-bit word |
+| Sign correction  | XOR + carry-in (2's complement) |
+| Accumulate       | Plain INT16/INT32 adder |
+| **Multiplier**   | **None** |
 
 ## Architecture
 
 ```
-                     Avalon-MM Slave (32-bit)               Avalon-MM Master (256-bit)
-                           │                                         │
-  HPS (ARM) ───────────────┤                             DDR3 ◄──────┘
-                           │                                         │
-                     ┌─────▼──────┐                          ┌───────▼────────┐
-                     │ ControlRegs │                          │ WeightStreamer  │
-                     └──┬──┬──┬───┘                          │ (double-buffer │
-                        │  │  │                               │  prefetch)     │
-              ┌─────────┘  │  └──────────┐                   └───────┬────────┘
-              ▼            ▼             ▼                            │ 256-bit packed weights
-        ActivationBuf  ResultMem    Config/Status           ┌────────▼─────────┐
-       (BRAM 2048×8)  (BRAM 1024×32)                       │  WeightDecoder   │
-              │                                             │  (2-bit unpack)  │
-              │  128× INT8 activations                      └────────┬────────┘
-              ▼                                             128× {enable, sign}
-        ┌──────────────────────────────────────────────────────────────┐
-        │                    PEArray (128 PEs)                         │
-        │  PE: enable=0 → 0  |  enable=1,sign=0 → +act  |  sign=1 → -act  │
-        └──────────────────────────┬───────────────────────────────────┘
-                                   │ 128× 9-bit products
-                              ┌────▼─────┐
-                              │ AdderTree │  7-level binary reduction
-                              │ (pipelined│  Register at every level
-                              │  7 cycles)│  → 16-bit sum
-                              └────┬─────┘
-                                   │
-                              ┌────▼──────┐
-                              │ Accumulate│  20-bit across K-dim tiles
-                              └────┬──────┘
-                                   │
-                              ┌────▼──────┐
-                              │ Raw 32-bit│  Full-precision output
-                              │  output   │  (ARM-side dequantization)
-                              └────┬──────┘
-                                   │
-                                   ▼
-                              Result Memory
+                Avalon-MM Slave (32-bit)            Avalon-MM Master (128-bit)
+                       │                                       │
+  HPS (ARM) ───────────┤                            DDR3 ◄─────┘
+                       │                                       │
+                  ┌────▼─────┐                       ┌─────────▼──────────┐
+                  │ CtrlRegs │                       │ TMacWeightStreamer │
+                  └──┬───┬───┘                       │  • nibBuf A/B      │
+                     │   │                           │  • signBuf A/B     │
+                     ▼   ▼                           │  • per-row stride  │
+              ActBuf  ResBuf                         │    accumulator     │
+            (BRAM)  (BRAM)                           └─────────┬──────────┘
+                │                                              │
+                │   3× INT8 act per group           nibble + sign streams
+                ▼                                              │
+          ┌──────────────┐                            ┌────────▼─────────┐
+          │  LutBuilder  │── 16-entry LUT word ──────►│   LutBram (banks)│
+          │  (3-stage:   │                            └────────┬─────────┘
+          │   read →     │                                     │
+          │   compute →  │                            ┌────────▼─────────┐
+          │   write)     │                            │ TMacComputeCore  │
+          └──────────────┘                            │  • 32 engines    │
+                                                      │  • Stage 2a: MUX │
+                                                      │  • Stage 2b: sgn │
+                                                      │  • 6-level adder │
+                                                      │    tree          │
+                                                      │  • Row accum     │
+                                                      └────────┬─────────┘
+                                                               │
+                                                       ┌───────▼────────┐
+                                                       │  Requantize    │
+                                                       │  (shift+clamp) │
+                                                       └───────┬────────┘
+                                                               ▼
+                                                          Result BRAM
 ```
 
-## Top-Level Ports
+## Top-Level Module
 
-The generated module is `BitNetAccelerator` in `chisel/generated/BitNetAccelerator.sv`.
+The generated module is `TMacAccelerator` in `chisel/generated/TMacAccelerator.sv`.
 
 ```systemverilog
-module BitNetAccelerator(
+module TMacAccelerator(
   input          clock,
   input          reset,
 
-  // Avalon-MM Slave — connect to HPS-to-FPGA Lightweight Bridge
+  // Avalon-MM Slave — HPS Lightweight Bridge
   input  [14:0]  io_slave_address,
   input          io_slave_read,
   input          io_slave_write,
   input  [31:0]  io_slave_writedata,
   output [31:0]  io_slave_readdata,
 
-  // Avalon-MM Master — connect to FPGA-to-SDRAM Bridge
+  // Avalon-MM Master — FPGA-to-SDRAM Bridge (128-bit)
   output [31:0]  io_master_address,
   output         io_master_read,
-  input  [255:0] io_master_readdata,
+  output         io_master_write,
+  output [127:0] io_master_writedata,
+  input  [127:0] io_master_readdata,
   input          io_master_waitrequest,
   input          io_master_readdatavalid,
   output [4:0]   io_master_burstcount
 );
 ```
 
-### Avalon-MM Slave (HPS Control)
-
-- 15-bit byte address space (32 KB)
-- 32-bit data width
-- Read latency: 1 (SyncReadMem for result buffer)
-- Connect to **Lightweight HPS-to-FPGA bridge** in Platform Designer
-
-### Avalon-MM Master (DDR3 Weight Reads)
-
-- 32-bit byte address
-- 256-bit read data (carries 128 weights per beat at 2 bits each)
-- 5-bit burst count (up to 16-beat bursts)
-- Connect to **FPGA-to-SDRAM bridge** in Platform Designer
-- Supports `waitrequest` / `readdatavalid` handshake
-- Double-buffered prefetch: overlaps DDR3 reads for row N+1 with row N compute
-
 ## Register Map
-
-All registers are accessed through the Avalon-MM slave interface. Byte-addressed, 32-bit aligned.
 
 | Offset | Name | R/W | Description |
 |--------|------|-----|-------------|
-| `0x00` | CTRL | W | Bit 0: START — pulse 1 to begin computation (auto-clears, also clears DONE) |
-| `0x04` | STATUS | R | Bit 0: BUSY, Bit 1: DONE |
-| `0x08` | WEIGHT_BASE | R/W | DDR3 byte address of weight matrix |
-| `0x0C` | DIM_M | R/W | Number of output rows (max 1024) |
-| `0x10` | DIM_K | R/W | Reduction dimension / input length (max 2048) |
-| `0x14` | SHIFT_AMT | R/W | Requantization right-shift amount (0–31, unused in raw output mode) |
-| `0x18` | PERF_CYCLES | R | Clock cycles elapsed during last computation |
-| `0x80`–`0x207C` | ACT_DATA | W | Activation buffer — write INT8 values, stride-4 byte addressing: offset `0x80 + i*4` writes activation[i] (up to maxDimK=2048 entries) |
-| `0x4000`+ | RES_DATA | R | Result buffer — read raw 32-bit accumulator outputs, stride-4 byte addressing: offset `0x4000 + i*4` reads result[i] |
+| `0x00` | CTRL          | W   | Bit 0: START pulse |
+| `0x04` | STATUS        | R   | Bit 0: BUSY, Bit 1: DONE |
+| `0x08` | WEIGHT_BASE   | R/W | DDR3 byte address of nibble array |
+| `0x0C` | DIM_M         | R/W | Number of output rows |
+| `0x10` | DIM_K         | R/W | Reduction dimension (max 4096) |
+| `0x14` | SHIFT_AMT     | R/W | Requantization right-shift |
+| `0x18` | PERF_CYCLES   | R   | Cycles of last run |
+| `0x1C` | **DIM_N3**    | R/W | **HPS-supplied K/3** — eliminates the on-chip non-power-of-2 divider that previously dominated the critical path |
+| `0x20` | WEIGHTS_PER_BEAT | R/W | (legacy) |
+| `0x24` | ENCODING_MODE | R/W | (legacy) |
+| `0x28` | ACT_DDR3_BASE | R/W | DDR3 base for activation DMA |
+| `0x80`+  | ACT_DATA  | W | Direct activation register write (PIO mode) |
+| `0x4000`+| RES_DATA  | R | Result buffer read |
 
-## Output Mode
+## 100 MHz Timing Closure
 
-The accelerator outputs **raw 32-bit accumulator values** (no shift/clamp). This preserves full precision for ARM-side dequantization:
+The accelerator runs at **100 MHz** on Cyclone V `5CSEBA6U23I7`. Closing timing required several micro-architectural rewrites of the worst critical paths reported by TimeQuest:
 
-```
-out[i] = raw_accum[i] / (scale_x * weight_scale)
-```
+| Optimization | Why |
+|--------------|-----|
+| **HPS supplies `DIM_N3 = K/3`** | Removed a 17-level combinational divider (non-power-of-2). Setup slack improved from −19.846 ns → −4.744 ns; Fmax 34 MHz → 67 MHz. |
+| **WeightStreamer per-row stride accumulator** | Eliminated `rowIdx × tilesPerRow` and `rowIdx × signBeats` variable×variable LUT multipliers. Replaced by `base += stride` each row. |
+| **LutBuilder three-stage pipeline (`sRead → sCompute → sWrite`)** | Broke a BRAM → 16 INT16 adders → BRAM single-cycle path. The 16 LUT entries are now registered before the LUT BRAM write. |
+| **TMacComputeCore split LUT MUX / sign correction** | The 16:1 MUX on a 256-bit LUT word + the conditional negate were too long for a single 10 ns cycle. Now in two pipeline stages. |
+| **QSys clock declaration 50 → 100 MHz** | The PLL was producing 100 MHz but `clk_0` was declared as 50 MHz, mismatching STA constraints. |
 
-This approach avoids lossy INT8 requantization on the FPGA, enabling accurate inference for models like BitMamba 255M where precision matters.
-
-## Platform Designer Integration (Quartus)
-
-### 1. Add the SystemVerilog Source
-
-Import `chisel/generated/BitNetAccelerator.sv` into the Quartus project.
-
-### 2. Create a Platform Designer Component
-
-Create a new component wrapping `BitNetAccelerator`:
-
-**Interfaces to define:**
-
-| Interface | Type | Connect to |
-|-----------|------|------------|
-| `clock` / `reset` | Clock Input / Reset Input | System clock (100 MHz PLL output) |
-| `io_slave_*` | Avalon-MM Slave | HPS Lightweight Bridge (`h2f_lw`) |
-| `io_master_*` | Avalon-MM Master | FPGA-to-SDRAM Bridge (`f2sdram`) |
-
-**Slave interface settings:**
-- Address width: 15 bits
-- Data width: 32 bits
-- Read latency: 1 (due to SyncReadMem for result buffer)
-
-**Master interface settings:**
-- Address width: 32 bits
-- Data width: 256 bits
-- Burst count width: 5 bits
-- Read latency: variable (use `readdatavalid` pipelining)
-
-### 3. System Connections
-
-In Platform Designer (Qsys):
-
-```
-HPS
- ├── h2f_lw_axi_master ──► bitnet_accel.slave
- └── f2sdram ◄── bitnet_accel.master
-
-clk_0.clk ──► bitnet_accel.clock
-clk_0.clk_reset ──► bitnet_accel.reset
-```
-
-### 4. Address Assignment
-
-Assign the slave a base address in the HPS lightweight bridge space (default `0xFF200000` on DE10-Nano). The master addresses DDR3 directly using physical addresses.
-
-## HPS Software Usage
-
-From Linux on the HPS, use the FPGA driver header (`bitnet_fpga.h`):
-
-```c
-#include "bitnet_fpga.h"
-
-// Initialize: map lightweight bridge + DDR3 weight region
-fpga_init(0x30000000, 0x00100000);
-
-// Load pre-converted FPGA weight binary into DDR3
-fpga_load_weights("model_fpga.bin");
-
-// Option A: Low-level INT8 matmul (raw 32-bit accumulator output)
-int8_t activations[K];
-int32_t results[M];
-fpga_bitlinear(activations, K, weight_base, M, stride, results);
-
-// Option B: Full float-to-float BitLinear with ARM-side quant/dequant
-float x[K], out[M], norm_weight[K];
-bitlinear_forward_fpga(x, K, M, norm_weight, weight_base, weight_scale, stride, out);
-
-// Cleanup
-fpga_cleanup();
-```
-
-The driver handles M-tiling automatically: for M > 1024, it splits across multiple FPGA invocations while reusing activations in BRAM.
-
-## Weight Packing Format
-
-Weights are stored in DDR3 as 2-bit packed values, 128 weights per 256-bit word:
-
-```
-Bit encoding (per weight):
-  00 → weight =  0   (PE disabled)
-  01 → weight = +1   (PE enabled, positive)
-  10 → weight = -1   (PE enabled, negative)
-  11 → reserved      (PE disabled)
-
-256-bit word layout:
-  [1:0]     = weight for PE 0
-  [3:2]     = weight for PE 1
-  ...
-  [255:254] = weight for PE 127
-```
-
-Weight matrix layout in DDR3 (row-major, M rows, each row has `ceil(K/128)` beats):
-
-```
-Address = WEIGHT_BASE + row * ceil(K/128) * 32 + tile * 32
-```
+The full pipeline depth is 10 stages (BRAM read + nibble/sign align + LUT MUX reg + sign reg + 6-level adder tree + accumulator).
 
 ## Default Configuration
 
 | Parameter | Value |
 |-----------|-------|
-| Processing Elements | 128 |
-| Activation width | 8-bit (INT8) |
-| Accumulator width | 20-bit |
-| Result buffer | 32-bit raw accumulator |
-| Adder tree depth | 7 levels |
-| Adder tree pipeline | 7 cycles (1 register per level) |
-| Max M dimension | 1024 |
-| Max K dimension | 2048 |
-| Avalon data width | 256-bit |
+| T-MAC engines | 32 (parallel LUT lookups per cycle) |
+| Group size    | 3 (activations per LUT) |
+| LUT entries / group | 16 (4-bit nibble index) |
+| LUT entry width | 16-bit signed |
+| Activation width | INT8 |
+| Adder tree | 6 levels, fully pipelined |
+| Avalon data width | 128-bit |
 | Avalon address width | 32-bit |
+| Burst count width | 5-bit (max 16-beat bursts) |
+| Max M | 1024 |
+| Max K | **4096** (sized for BitMamba 1B `out_proj`) |
 | Target clock | 100 MHz |
+| **DSP blocks** | **0** |
 
-## Resource Estimate (Cyclone V)
+## Module Map
 
-| Resource | Estimated Usage |
-|----------|----------------|
-| ALMs | ~5,000–7,000 |
-| M10K blocks | ~10 (activation buffer + result buffer + weight FIFOs) |
-| DSP blocks | **0** |
-| Fmax target | 100 MHz |
+| Module | Role |
+|--------|------|
+| `TMacAccelerator` | Top-level FSM, row iteration, slave wiring |
+| `TMacControlRegs` | Avalon-MM slave + register file (incl. `DIM_N3`) |
+| `TMacWeightStreamer` | DDR3 prefetch with `nibBuf A/B` + `signBuf A/B`, per-row stride accumulator (no multipliers) |
+| `LutBuilder` | 3-stage pipelined LUT construction from activation triples |
+| `LutBram` | Multi-bank LUT storage feeding the compute core |
+| `TMacComputeCore` | 32-engine parallel LUT lookup + sign correction + 6-level adder tree + row accumulator |
+| `ActivationBuffer` | INT8 activation BRAM |
+| `ResultBuffer` | Output BRAM (raw accumulator or requantized) |
+| `Requantizer` | `(acc >> shift).clamp(-128, 127)` |
+| `AvalonMMReadMaster` / `AvalonMMWriteMaster` | 128-bit AXI/Avalon protocol wrappers |
 
-## Building from Chisel Source
-
-Requires sbt and Java 11+.
+## Verification
 
 ```bash
 cd chisel
-sbt compile                          # Compile
-sbt test                             # Run all 8 test suites
-sbt "runMain bitnet.BitNetAccelMain" # Regenerate SystemVerilog
+sbt test                                    # 8 suites, 82 tests
+sbt "testOnly bitnet.LutBuilderTest"        # single suite
+sbt "runMain bitnet.TMacAccelMain"          # regenerate SystemVerilog
 ```
 
-Output: `chisel/generated/BitNetAccelerator.sv`
+All 82 ScalaTest cases pass on the current `turbo` branch. `LutBuilderTest` cross-checks every 16-entry LUT against the `biturbo.c` reference implementation across multiple banks.
+
+## Platform Designer Integration
+
+1. Import `chisel/generated/TMacAccelerator.sv` into the Quartus project.
+2. Wrap it as a Platform Designer component with one Avalon-MM slave (15-bit addr, 32-bit data, read latency 1) and one Avalon-MM master (32-bit addr, 128-bit data, variable latency, write enabled).
+3. Connect:
+   - `slave` → `hps_0.h2f_lw_axi_master`
+   - `master` → `hps_0.f2sdram` bridge
+   - `clock` ← 100 MHz PLL output (declare `clk_0.clockFrequency = 100000000`)
+4. Assign the slave a base address inside the lightweight bridge (default `0xFF200000`).
+
+## HPS Software Usage
+
+```c
+#include "bitnet_fpga.h"
+
+fpga_init(0x30000000, 0x00100000);
+fpga_load_weights("model_fpga.bin");
+
+// Configure dimensions — N3 = K/3 must be supplied by HPS
+fpga_reg_write(REG_DIM_M,  M);
+fpga_reg_write(REG_DIM_K,  K);
+fpga_reg_write(REG_DIM_N3, K / 3);          // ← required
+
+fpga_bitlinear(activations, K, weight_base, M, stride, results);
+fpga_cleanup();
+```
 
 ## License
 
