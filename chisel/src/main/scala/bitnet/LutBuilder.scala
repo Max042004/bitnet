@@ -47,15 +47,19 @@ class LutBuilder(implicit val cfg: TMacConfig) extends Module {
   // Pipeline: sRead → sCompute (register 16 entries) → sWrite (to LutBram).
   // Inserting the sCompute register stage splits the BRAM→combinational→BRAM
   // path that was the 100 MHz critical path (6 logic levels, 13 ns).
-  val sIdle :: sRead :: sCompute :: sWrite :: sDone :: Nil = Enum(5)
+  val sIdle :: sRead :: sCapture :: sCompute :: sWrite :: sDone :: Nil = Enum(6)
   val state = RegInit(sIdle)
 
   val groupIdx = RegInit(0.U(cfg.dimW.W))
   val totalGroups = RegInit(0.U(cfg.dimW.W))
 
-  // Registered LUT entries (stage between activation read and LutBram write)
+  // Registered activations and LUT entries.
+  val act0Reg = Reg(SInt(cfg.activationW.W))
+  val act1Reg = Reg(SInt(cfg.activationW.W))
+  val act2Reg = Reg(SInt(cfg.activationW.W))
   val entriesReg = Reg(Vec(cfg.lutEntries, SInt(cfg.lutWidth.W)))
   val groupIdxD2 = RegInit(0.U(cfg.dimW.W))
+  val groupIdxD3 = RegInit(0.U(cfg.dimW.W))
 
   // Activation read addresses (group g → activations g*3, g*3+1, g*3+2)
   val baseIdx = groupIdx * 3.U
@@ -83,14 +87,21 @@ class LutBuilder(implicit val cfg: TMacConfig) extends Module {
     }
     is(sRead) {
       // Addresses are presented this cycle; data arrives next cycle
+      state := sCapture
+    }
+    is(sCapture) {
+      act0Reg := io.actData0
+      act1Reg := io.actData1
+      act2Reg := io.actData2
+      groupIdxD2 := groupIdxD1
       state := sCompute
     }
     is(sCompute) {
       // BRAM data is now valid for groupIdxD1. Compute 16 entries and
       // *register* them — this is the new pipeline boundary.
-      val a0 = io.actData0.asSInt
-      val a1 = io.actData1.asSInt
-      val a2 = io.actData2.asSInt
+      val a0 = act0Reg
+      val a1 = act1Reg
+      val a2 = act2Reg
 
       // Widen to lutWidth for addition headroom
       val a0w = Wire(SInt(cfg.lutWidth.W)); a0w := a0
@@ -114,7 +125,7 @@ class LutBuilder(implicit val cfg: TMacConfig) extends Module {
       entriesReg(14) := 0.S
       entriesReg(15) := 0.S
 
-      groupIdxD2 := groupIdxD1
+      groupIdxD3 := groupIdxD2
       state := sWrite
     }
     is(sWrite) {
@@ -123,11 +134,11 @@ class LutBuilder(implicit val cfg: TMacConfig) extends Module {
       packed := Cat(entriesReg.reverse.map(_.asUInt))
 
       io.lutWriteEn   := true.B
-      io.lutWriteBank := groupIdxD2(bankSelW - 1, 0)
-      io.lutWriteAddr := (groupIdxD2 >> bankSelW.U)(bankAddrW - 1, 0)
+      io.lutWriteBank := groupIdxD3(bankSelW - 1, 0)
+      io.lutWriteAddr := (groupIdxD3 >> bankSelW.U)(bankAddrW - 1, 0)
       io.lutWriteData := packed
 
-      val nextGroup = groupIdxD2 + 1.U
+      val nextGroup = groupIdxD3 + 1.U
       when(nextGroup >= totalGroups) {
         state := sDone
       }.otherwise {
