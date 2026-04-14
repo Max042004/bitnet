@@ -291,9 +291,9 @@ class TMacAccelerator(implicit val cfg: TMacConfig) extends Module {
         state := sWaitPipeline
       }.otherwise {
         currentTile := nextTile
-        // Present next tile address (data valid next cycle)
+        // Prefetch the next weight beat, but keep computeCore.io.tileIdx on
+        // the current tile so today's weight data aligns with today's LUT read.
         weightStr.io.tileIdx := nextTile
-        computeCore.io.tileIdx := nextTile
       }
     }
 

@@ -45,8 +45,10 @@ class TMacComputeCore(implicit val cfg: TMacConfig) extends Module {
   val tilesPerRow = (io.numGroups + (cfg.numEngines - 1).U) / cfg.numEngines.U
 
   // --- Stage 1: Present LUT BRAM addresses ---
-  // All engines read the same tile address (their bank has different data)
-  val tileAddr = (io.tileIdx >> log2Ceil(cfg.numEngines).U)(bankAddrW - 1, 0)
+  // All engines read the same tile address (their bank has different data).
+  // io.tileIdx is already the tile number, so using tileIdx >> log2(numEngines)
+  // would alias 32 consecutive tiles onto the same LUT address.
+  val tileAddr = io.tileIdx(bankAddrW - 1, 0)
   for (e <- 0 until cfg.numEngines) {
     io.lutReadAddr(e) := tileAddr
   }
