@@ -81,7 +81,8 @@ class TMacActivationLoader(implicit val cfg: TMacConfig) extends Module {
         io.bulkWriteEn := true.B
         io.bulkWriteBase := beatsReceived << log2Ceil(actsPerBeat).U
         for (i <- 0 until actsPerBeat) {
-          io.bulkWriteData(i) := io.avalon_readdata(i * cfg.activationW + cfg.activationW - 1, i * cfg.activationW).asSInt
+          val rawByte = io.avalon_readdata(i * 8 + 7, i * 8)
+          io.bulkWriteData(i) := rawByte.asSInt.pad(cfg.activationW)
         }
         beatsReceived := beatsReceived + 1.U
       }
